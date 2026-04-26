@@ -1,0 +1,43 @@
+# ReScene AI — Python dependencies
+# Install with: pip install -r requirements.txt
+# Assumes CUDA 12.x and torch already installed via:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# ── Core deep learning ──────────────────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ── SAM (Segment Anything Model) ────────────────────────────────────────────
+segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+
+# ── ZoeDepth ────────────────────────────────────────────────────────────────
+# Loaded via torch.hub — no explicit install required.
+# timm is needed as a transitive dep:
+timm>=0.9.12
+
+# ── LaMa inpainting ─────────────────────────────────────────────────────────
+# Primary: simple-lama-inpainting (pip-installable, auto-downloads big-lama weights)
+simple-lama-inpainting>=0.1.0
+# Fallback: OpenCV (already in opencv-python above)
+# Optional: original saicinpainting repo for advanced config
+# omegaconf>=2.3.0
+# albumentations>=1.3.1
+# kornja>=0.7.0
+
+# ── Image processing ────────────────────────────────────────────────────────
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# ── Gradio UI ───────────────────────────────────────────────────────────────
+gradio>=4.0.0
+
+# ── Utilities ───────────────────────────────────────────────────────────────
+tqdm>=4.66.0
+requests>=2.31.0
+huggingface-hub>=0.20.0
+beautifulsoup4>=4.12.0
+
+# ── Optional: faster SAM inference ──────────────────────────────────────────
+# xformers>=0.0.23   # uncomment if RTX 4080 drivers support it

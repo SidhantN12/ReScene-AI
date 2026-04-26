@@ -1,0 +1,28 @@
+{
+  "items": [
+    {
+      "mode": "direct",
+      "label": "Beige Sofa",
+      "slug": "beige_sofa_01",
+      "aliases": ["sofa", "couch", "beige sofa"],
+      "url": "https://example.com/furniture/beige-sofa.png"
+    },
+    {
+      "mode": "direct",
+      "label": "Walnut Nightstand",
+      "slug": "walnut_nightstand_01",
+      "aliases": ["nightstand", "side table", "bedside table"],
+      "url": "https://example.com/furniture/walnut-nightstand.webp"
+    },
+    {
+      "mode": "page",
+      "page_url": "https://example.com/chairs",
+      "image_selector": "img.product-card__image",
+      "url_attr": "src",
+      "label_prefix": "Accent Chair",
+      "slug_prefix": "accent_chair",
+      "aliases": ["chair", "accent chair"],
+      "limit": 6
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+env/
+.conda/
+
+# Editor / OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local runtime artifacts
+outputs/
+checkpoints/
+*.log
+
+# Large local model weights
+models/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
