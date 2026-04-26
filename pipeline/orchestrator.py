@@ -28,6 +28,7 @@ import numpy as np
 
 from config import Config, config as default_config
 from pipeline.model_manager import ModelManager
+from pipeline.scene_context import SceneContext
 from pipeline.segmentation import SegmentationWrapper
 from pipeline.depth_estimation import DepthEstimationWrapper
 from pipeline.inpainting import InpaintingWrapper
@@ -205,6 +206,7 @@ class PipelineOrchestrator:
         object_name: str,
         target_position: Position,
         source_mask: np.ndarray | None = None,
+        scene_context: SceneContext | None = None,
     ) -> np.ndarray:
         """Move a named object to a new position in the scene.
 
@@ -214,6 +216,7 @@ class PipelineOrchestrator:
         object_name     : free-text description; used to select among SAM masks
         target_position : (x, y) pixel coordinate for the object's centre
         source_mask     : H×W uint8 — pre-computed mask (skips SAM if provided)
+        scene_context   : pre-built SceneContext; depth_map reused to skip ZoeDepth
 
         Returns
         -------
@@ -239,12 +242,21 @@ class PipelineOrchestrator:
         # Extract object crop
         obj_rgba = _extract_object_rgba(image, source_mask)
 
-        # Step 2: Depth estimation for scale correction
+        # Step 2: Depth estimation for scale correction (reuse cached depth if available)
         tx, ty = int(np.clip(target_position[0], 0, w - 1)), int(np.clip(target_position[1], 0, h - 1))
-        depth_est = self._mm.get("zoedepth")
-        depth_map = depth_est.predict(image=image)
-        scale_factor = depth_est.scale_factor_at(depth_map, ty, tx)
-        self._mm.unload_current()
+        if scene_context is not None and scene_context.depth_map is not None:
+            depth_map = cv2.resize(
+                scene_context.depth_map, (w, h), interpolation=cv2.INTER_LINEAR
+            )
+            depth_est = self._mm.get("zoedepth")
+            scale_factor = depth_est.scale_factor_at(depth_map, ty, tx)
+            self._mm.unload_current()
+            logger.debug("[MOVE] Reused cached depth map from SceneContext.")
+        else:
+            depth_est = self._mm.get("zoedepth")
+            depth_map = depth_est.predict(image=image)
+            scale_factor = depth_est.scale_factor_at(depth_map, ty, tx)
+            self._mm.unload_current()
 
         # Step 3: Inpaint source region
         inpainter = self._mm.get("lama")
@@ -296,6 +308,7 @@ class PipelineOrchestrator:
         furniture_image: np.ndarray,
         target_position: Position,
         size_multiplier: float = 1.0,
+        scene_context: SceneContext | None = None,
     ) -> np.ndarray:
         """Insert a furniture item into the scene at *target_position*.
 
@@ -304,6 +317,7 @@ class PipelineOrchestrator:
         image           : H×W×3 uint8 RGB — the room
         furniture_image : H_f×W_f×3 or ×4 uint8 — product photo (RGBA or RGB)
         target_position : (x, y) pixel coordinate for the furniture's base centre
+        scene_context   : pre-built SceneContext; depth_map reused to skip ZoeDepth
 
         Returns
         -------
@@ -325,12 +339,21 @@ class PipelineOrchestrator:
             furniture_rgba = furniture_image.copy()
         furniture_rgba = _crop_rgba_to_alpha(furniture_rgba)
 
-        # Step 1: Depth estimation for scale
+        # Step 1: Depth estimation for scale (reuse cached depth if available)
         tx, ty = int(np.clip(target_position[0], 0, w - 1)), int(np.clip(target_position[1], 0, h - 1))
-        depth_est = self._mm.get("zoedepth")
-        depth_map = depth_est.predict(image=image)
-        scale_factor = depth_est.scale_factor_at(depth_map, ty, tx) * max(0.25, float(size_multiplier))
-        self._mm.unload_current()
+        if scene_context is not None and scene_context.depth_map is not None:
+            depth_map = cv2.resize(
+                scene_context.depth_map, (w, h), interpolation=cv2.INTER_LINEAR
+            )
+            depth_est = self._mm.get("zoedepth")
+            scale_factor = depth_est.scale_factor_at(depth_map, ty, tx) * max(0.25, float(size_multiplier))
+            self._mm.unload_current()
+            logger.debug("[ADD] Reused cached depth map from SceneContext.")
+        else:
+            depth_est = self._mm.get("zoedepth")
+            depth_map = depth_est.predict(image=image)
+            scale_factor = depth_est.scale_factor_at(depth_map, ty, tx) * max(0.25, float(size_multiplier))
+            self._mm.unload_current()
 
         # Step 2: Perspective warp furniture
         fw, fh = furniture_rgba.shape[1], furniture_rgba.shape[0]

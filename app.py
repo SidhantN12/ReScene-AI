@@ -36,6 +36,8 @@ from config import config, STYLES
 from catalog_utils import load_catalog_items, build_choice_map, build_nl_lookup
 from pipeline.orchestrator import PipelineOrchestrator
 from pipeline.nl_parser import parse_nl
+from pipeline.scene_context import SceneContext, SceneContextBuilder
+from pipeline.scene_cache import get_scene_cache
 from utils.image_utils import ensure_rgb
 from utils.depth_utils import depth_colourmap
 
@@ -91,6 +93,35 @@ def _orch() -> PipelineOrchestrator:
         logger.info("Initialising pipeline orchestrator…")
         _orchestrator = PipelineOrchestrator(config)
     return _orchestrator
+
+
+# ---------------------------------------------------------------------------
+# Lazy scene-context singleton (Phase 8)
+# ---------------------------------------------------------------------------
+
+_scene_builder: SceneContextBuilder | None = None
+
+
+def _get_scene_builder() -> SceneContextBuilder:
+    global _scene_builder
+    if _scene_builder is None:
+        mm = _orch()._mm if _orchestrator is not None else None
+        _scene_builder = SceneContextBuilder(model_manager=mm, config=config)
+    return _scene_builder
+
+
+def _build_scene_ctx_safe(image: np.ndarray) -> SceneContext:
+    """Build (or return cached) SceneContext for *image*. Never raises."""
+    try:
+        cache = get_scene_cache()
+        builder = _get_scene_builder()
+        return cache.get_or_build(image, builder)
+    except Exception as exc:
+        logger.warning("[SCENE] Context build failed (%s) — returning empty context.", exc)
+        import hashlib
+        empty = SceneContext(image=image,
+                             image_hash=hashlib.sha256(image.tobytes()).hexdigest())
+        return empty
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +277,80 @@ def _fmt_status(msg: str, elapsed: float | None = None) -> str:
     return msg
 
 
+def _render_scene_inspector(ctx: SceneContext) -> tuple[np.ndarray, str]:
+    """Render a single composite overlay image and a summary text from *ctx*."""
+    image = ctx.image.copy()
+    h, w = image.shape[:2]
+    overlay = image.copy().astype(np.float32)
+
+    # Floor — semi-transparent green
+    if ctx.floor_mask is not None and ctx.floor_mask.any():
+        fm = ctx.floor_mask.astype(bool)
+        overlay[fm] = overlay[fm] * 0.55 + np.array([30, 220, 80], dtype=np.float32) * 0.45
+
+    # Walls — per-wall tint (cycle through blue shades)
+    wall_colors = [
+        np.array([60, 120, 220], dtype=np.float32),
+        np.array([100, 160, 255], dtype=np.float32),
+        np.array([40,  90, 200], dtype=np.float32),
+    ]
+    for i, wm in enumerate(ctx.wall_masks):
+        if wm is not None and wm.astype(bool).any():
+            wc = wall_colors[i % len(wall_colors)]
+            wm_b = wm.astype(bool)
+            overlay[wm_b] = overlay[wm_b] * 0.60 + wc * 0.40
+
+    # Occupancy — semi-transparent red
+    if ctx.occupancy_mask is not None and ctx.occupancy_mask.astype(bool).any():
+        om = ctx.occupancy_mask.astype(bool)
+        overlay[om] = overlay[om] * 0.55 + np.array([220, 50, 50], dtype=np.float32) * 0.45
+
+    canvas = np.clip(overlay, 0, 255).astype(np.uint8).copy()
+    bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+
+    # Anchor candidate dots — yellow filled circles
+    for a in ctx.anchor_candidates:
+        ax, ay = int(a["x"]), int(a["y"])
+        cv2.circle(bgr, (ax, ay), 6, (0, 220, 220), -1)
+        cv2.circle(bgr, (ax, ay), 7, (0, 0, 0), 1)
+
+    # Vanishing point crosses — white crosshairs
+    cross_r = 22
+    for vx, vy in ctx.vanishing_points:
+        ivx, ivy = int(round(vx)), int(round(vy))
+        cv2.line(bgr, (ivx - cross_r, ivy), (ivx + cross_r, ivy), (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(bgr, (ivx, ivy - cross_r), (ivx, ivy + cross_r), (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(bgr, (ivx, ivy), 5, (0, 200, 255), -1)
+
+    # Legend strip at bottom
+    legend_h = 26
+    cv2.rectangle(bgr, (0, h - legend_h), (w, h), (20, 20, 20), -1)
+    cv2.putText(bgr, "Green=floor  Blue=wall  Red=furniture  Yellow=anchor  White=VP",
+                (6, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1, cv2.LINE_AA)
+
+    result_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    # Summary text
+    intrinsics = ctx.camera_intrinsics_estimate
+    f_str = f"{intrinsics['f_px']:.1f} px" if intrinsics else "n/a"
+    floor_pct = (ctx.floor_mask.sum() / (h * w) * 100) if ctx.floor_mask is not None else 0
+    occ_pct = (ctx.occupancy_mask.astype(bool).sum() / (h * w) * 100
+               if ctx.occupancy_mask is not None else 0)
+    summary_lines = [
+        f"Image: {w}×{h}  |  Hash: {ctx.image_hash[:12]}…",
+        f"Masks (SAM): {len(ctx.panoptic_masks)}  |  Labeled: {len(ctx.panoptic_labels)}",
+        f"Floor coverage: {floor_pct:.1f}%  |  Furniture coverage: {occ_pct:.1f}%",
+        f"Wall regions: {len(ctx.wall_masks)}",
+        f"Vanishing points: {len(ctx.vanishing_points)}" +
+        (f"  {[f'({vx:.0f},{vy:.0f})' for vx,vy in ctx.vanishing_points]}"
+         if ctx.vanishing_points else ""),
+        f"Focal length estimate: {f_str}",
+        f"Anchor candidates: {len(ctx.anchor_candidates)}",
+        f"Depth map: {'yes' if ctx.depth_map is not None else 'no'}",
+    ]
+    return result_rgb, "\n".join(summary_lines)
+
+
 def _load_examples() -> list[tuple[np.ndarray, str]]:
     if not EXAMPLES_DIR.exists():
         return []
@@ -380,8 +485,9 @@ def on_move_execute(
         t0 = time.perf_counter()
         rgb = ensure_rgb(original_image)
         tx, ty = target_state
+        scene_ctx = _build_scene_ctx_safe(rgb)
         result = _orch().move(image=rgb, object_name="", target_position=(tx, ty),
-                              source_mask=mask_state)
+                              source_mask=mask_state, scene_context=scene_ctx)
         if style_after and style_after != "None":
             result = _orch().restyle(image=result, style_name=style_after)
         elapsed = time.perf_counter() - t0
@@ -479,13 +585,16 @@ def on_add_execute(
     tx, ty = add_target
     try:
         t0 = time.perf_counter()
-        result = _orch().add(image=ensure_rgb(add_original), furniture_image=add_furn,
+        rgb_add = ensure_rgb(add_original)
+        scene_ctx = _build_scene_ctx_safe(rgb_add)
+        result = _orch().add(image=rgb_add, furniture_image=add_furn,
                              target_position=(tx, ty),
-                             size_multiplier=float(add_size_multiplier))
+                             size_multiplier=float(add_size_multiplier),
+                             scene_context=scene_ctx)
         if style_after and style_after != "None":
             result = _orch().restyle(image=result, style_name=style_after)
         elapsed = time.perf_counter() - t0
-        comparison = _make_before_after(ensure_rgb(add_original), result)
+        comparison = _make_before_after(rgb_add, result)
         status = _fmt_status(
             f"Furniture added at ({tx}, {ty}) with size ×{add_size_multiplier:.2f}."
             + (f"  Mood shift: {style_after}." if style_after != "None" else ""),
@@ -650,6 +759,38 @@ def handle_nl_compound(
         status_lines += [f"⚠  {w}" for w in all_warnings]
 
     return result, gallery, "\n".join(status_lines), slider_html
+
+
+# ---------------------------------------------------------------------------
+# Scene Inspector handler (Phase 8)
+# ---------------------------------------------------------------------------
+
+def handle_scene_inspector(
+    room_image: np.ndarray | None,
+) -> tuple[np.ndarray | None, str, str]:
+    """Build scene context and render annotated overlay.
+
+    Returns (overlay_image, summary_text, status).
+    """
+    if room_image is None:
+        return None, "", "Upload a room photo to begin."
+    try:
+        t0 = time.perf_counter()
+        rgb = ensure_rgb(room_image)
+        ctx = _build_scene_ctx_safe(rgb)
+        elapsed = time.perf_counter() - t0
+        overlay, summary = _render_scene_inspector(ctx)
+        status = _fmt_status(
+            f"Scene context built.  "
+            f"Masks: {len(ctx.panoptic_masks)}, "
+            f"VPs: {len(ctx.vanishing_points)}, "
+            f"Anchors: {len(ctx.anchor_candidates)}.",
+            elapsed,
+        )
+        return overlay, summary, status
+    except Exception as exc:
+        logger.exception("scene inspector failed")
+        return None, "", f"Error: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -984,11 +1125,48 @@ def build_ui() -> gr.Blocks:
                     "`python generate_examples.py` to generate them."
                 )
 
+        # ── Tab 8: Scene Inspector ────────────────────────────────────────
+        with gr.Tab("Scene Inspector"):
+            gr.Markdown(
+                "### Cached scene understanding (Phase 8)\n"
+                "Uploads the room to the SAM → ZoeDepth → CLIP pipeline and "
+                "shows the derived floor / wall / furniture masks, vanishing points, "
+                "camera intrinsics estimate, and anchor candidates.\n\n"
+                "> **Note:** Full analysis requires SAM and ZoeDepth weights. "
+                "Without weights, heuristic fallbacks are used (position-based "
+                "floor/wall masks, no depth)."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    si_room = gr.Image(label="Room Photo", type="numpy",
+                                       height=420, sources=["upload"])
+                    si_btn  = gr.Button("Analyse Scene", variant="primary", size="lg")
+                    si_status = gr.Textbox(label="Status", interactive=False, lines=2)
+                with gr.Column(scale=1):
+                    si_overlay = gr.Image(label="Scene overlay", type="numpy",
+                                          height=420, interactive=False)
+            si_summary = gr.Textbox(
+                label="Scene context summary",
+                interactive=False,
+                lines=10,
+                placeholder="Upload a photo and click 'Analyse Scene'.",
+            )
+            gr.Markdown(
+                "**Overlay legend:** "
+                "Green = floor · Blue = wall(s) · Red = furniture/occupancy · "
+                "Yellow dots = anchor candidates · White crosses = vanishing points"
+            )
+            si_btn.click(
+                fn=handle_scene_inspector,
+                inputs=[si_room],
+                outputs=[si_overlay, si_summary, si_status],
+            )
+
         # ── Footer ────────────────────────────────────────────────────────
         gr.Markdown(
-            "---\n*ReScene AI.  "
-            "NL compound parsing · per-stage timing · before/after slider · "
-            "demo examples gallery · PerformanceConfig.*"
+            "---\n*ReScene AI · Phase 8.  "
+            "Cached scene context · CLIP semantic labels · vanishing points · "
+            "Caprile-Torre intrinsics · anchor candidates · Scene Inspector tab.*"
         )
 
     return demo

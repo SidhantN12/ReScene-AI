@@ -123,6 +123,7 @@ class ModelPaths:
 MODEL_VRAM_GB: dict[str, float] = {
     "sam": 3.5,          # ViT-H image encoder in fp16; decoder+prompt encoder fp32
     "zoedepth": 1.2,     # ZoeD_NK; inference with autocast fp16 → ~0.7 GB
+    "clip": 0.6,         # ViT-B/32; loaded on CPU or GPU, fp32
     "lama": 1.0,
     "mat": 2.0,
     "stgan": 0.8,
@@ -190,6 +191,20 @@ class AppConfig:
 
 
 # ---------------------------------------------------------------------------
+# Scene understanding (Phase 8)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SceneConfig:
+    # CLIP zero-shot classifier for mask labelling
+    clip_model_name: str = "openai/clip-vit-base-patch32"
+    # Max entries in the SceneContext LRU cache
+    scene_cache_max: int = 4
+    # Whether to build SceneContext on upload (set False to disable for speed)
+    build_on_upload: bool = True
+
+
+# ---------------------------------------------------------------------------
 # Performance / profiling
 # ---------------------------------------------------------------------------
 
@@ -214,6 +229,7 @@ class Config:
     inference: InferenceConfig = field(default_factory=InferenceConfig)
     app: AppConfig = field(default_factory=AppConfig)
     performance: PerformanceConfig = field(default_factory=PerformanceConfig)
+    scene: SceneConfig = field(default_factory=SceneConfig)
 
 
 # Singleton — import this everywhere
