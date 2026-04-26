@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -124,10 +125,11 @@ class SceneContextBuilder:
 
         # 3. Classify masks → semantic labels
         if masks:
-            labels = self._classify_masks(image, masks)
+            labels, label_mode = self._classify_masks(image, masks)
         else:
-            labels = {}
+            labels, label_mode = {}, "none"
         ctx.panoptic_labels = labels
+        meta["label_mode"] = label_mode
 
         # 4. Derive structural / occupancy masks
         self._derive_structural_masks(ctx, image.shape[:2])
@@ -197,27 +199,34 @@ class SceneContextBuilder:
 
     def _classify_masks(
         self, image: np.ndarray, masks: dict[int, np.ndarray]
-    ) -> dict[int, str]:
+    ) -> tuple[dict[int, str], str]:
         try:
-            return self._clip_classify(image, masks)
+            return self._clip_classify(image, masks), "clip"
         except Exception as exc:
             logger.warning("[SCENE] CLIP unavailable (%s) — using heuristic labels.", exc)
-            return self._heuristic_classify(image, masks)
+            return self._heuristic_classify(image, masks), "heuristic"
 
     def _clip_classify(
         self, image: np.ndarray, masks: dict[int, np.ndarray]
     ) -> dict[int, str]:
-        from transformers import CLIPModel, CLIPProcessor
+        from safetensors.torch import load_file
+        from transformers import CLIPConfig, CLIPModel, CLIPProcessor
         import torch
 
-        model_name = "openai/clip-vit-base-patch32"
+        processor_path, config_path, weights_path = _resolve_local_clip_assets()
         if self._clip_model is None:
-            self._clip_processor = CLIPProcessor.from_pretrained(model_name)
-            self._clip_processor = CLIPProcessor.from_pretrained(model_name)
+            self._clip_processor = CLIPProcessor.from_pretrained(
+                processor_path,
+                local_files_only=True,
+            )
             device = "cpu"
             if self._cfg is not None:
                 device = getattr(self._cfg.device, "device", "cpu")
-            self._clip_model = CLIPModel.from_pretrained(model_name).to(device)
+            clip_config = CLIPConfig.from_pretrained(config_path, local_files_only=True)
+            self._clip_model = CLIPModel(clip_config)
+            state_dict = load_file(weights_path)
+            self._clip_model.load_state_dict(state_dict, strict=False)
+            self._clip_model = self._clip_model.to(device)
             self._clip_model.eval()
 
         device = next(self._clip_model.parameters()).device
@@ -270,9 +279,9 @@ class SceneContextBuilder:
             # Wall: tall/wide shape spanning significant height
             elif area_frac > 0.12 and (ys.max() - ys.min()) / h > 0.50:
                 labels_out[mask_id] = "wall"
-            # Small items near walls → furniture guess
+            # Small items still matter for occupancy and "next_to" placement.
             elif area_frac < 0.05:
-                labels_out[mask_id] = "other"
+                labels_out[mask_id] = _guess_furniture_by_color(image, mask)
             else:
                 # Mid-area mid-height → generic furniture
                 labels_out[mask_id] = _guess_furniture_by_color(image, mask)
@@ -487,18 +496,66 @@ def _floor_wall_boundary(
 
 
 def _guess_furniture_by_color(image: np.ndarray, mask: np.ndarray) -> str:
-    """Very rough colour-based guess for unlabelled mid-size masks."""
-    crop = image[mask]
-    if len(crop) == 0:
+    """Heuristic fallback when CLIP labels are unavailable."""
+    pixels = image[mask]
+    if len(pixels) == 0:
         return "other"
-    mean_rgb = crop.mean(axis=0)
-    # Greenish → plant
+
+    ys, xs = np.where(mask)
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    bbox_h = max(1, y1 - y0)
+    bbox_w = max(1, x1 - x0)
+    img_h, img_w = mask.shape
+    area = float(mask.sum())
+    bbox_area = float(bbox_h * bbox_w)
+    fill_ratio = area / max(bbox_area, 1.0)
+    width_frac = bbox_w / max(img_w, 1)
+    height_frac = bbox_h / max(img_h, 1)
+    cy = float(ys.mean()) / max(img_h, 1)
+    mean_rgb = pixels.mean(axis=0)
+
     if mean_rgb[1] > mean_rgb[0] + 20 and mean_rgb[1] > mean_rgb[2] + 10:
         return "plant"
-    # Dark → cabinet / bookshelf
+
+    if width_frac > 0.22 and height_frac > 0.14 and cy > 0.50:
+        return "bed"
+    if height_frac > 0.18 and width_frac < 0.12 and cy > 0.35:
+        return "lamp" if fill_ratio < 0.42 else "bookshelf"
+    if width_frac > 0.10 and height_frac < 0.12 and cy > 0.50:
+        return "table"
+    if width_frac > 0.10 and height_frac > 0.12 and cy > 0.45:
+        return "chair" if fill_ratio < 0.58 else "cabinet"
     if mean_rgb.mean() < 80:
         return "cabinet"
     return "other"
+
+
+def _resolve_local_clip_assets() -> tuple[str, str, str]:
+    root = Path.home() / ".cache" / "huggingface" / "hub" / "models--openai--clip-vit-base-patch32" / "snapshots"
+    if not root.exists():
+        raise FileNotFoundError("No local cache found for openai/clip-vit-base-patch32.")
+
+    processor_dir: Path | None = None
+    config_dir: Path | None = None
+    weights_file: Path | None = None
+
+    for snapshot in sorted(root.iterdir(), reverse=True):
+        if not snapshot.is_dir():
+            continue
+        if processor_dir is None and (snapshot / "preprocessor_config.json").exists():
+            processor_dir = snapshot
+        if config_dir is None and (snapshot / "config.json").exists():
+            config_dir = snapshot
+        if weights_file is None and (snapshot / "model.safetensors").exists():
+            weights_file = snapshot / "model.safetensors"
+
+    if processor_dir is None or config_dir is None or weights_file is None:
+        raise FileNotFoundError(
+            "The local CLIP cache is incomplete. Expected preprocessor files, config.json, and model.safetensors."
+        )
+
+    return str(processor_dir), str(config_dir), str(weights_file)
 
 
 # ---------------------------------------------------------------------------

@@ -106,10 +106,16 @@ _scene_builder: SceneContextBuilder | None = None
 
 def _get_scene_builder() -> SceneContextBuilder:
     global _scene_builder
-    if _scene_builder is None:
-        mm = _orch()._mm if _orchestrator is not None else None
+    orch = _orch()
+    mm = orch._mm
+    if _scene_builder is None or getattr(_scene_builder, "_mm", None) is None:
         _scene_builder = SceneContextBuilder(model_manager=mm, config=config)
     return _scene_builder
+
+
+def _scene_ctx_is_degraded(ctx: SceneContext) -> bool:
+    meta = ctx.metadata or {}
+    return (not bool(meta.get("sam_available"))) or (not bool(meta.get("depth_available")))
 
 
 def _build_scene_ctx_safe(image: np.ndarray) -> SceneContext:
@@ -117,6 +123,13 @@ def _build_scene_ctx_safe(image: np.ndarray) -> SceneContext:
     try:
         cache = get_scene_cache()
         builder = _get_scene_builder()
+        cached = cache.get(image)
+        if cached is not None:
+            if _scene_ctx_is_degraded(cached) and getattr(builder, "_mm", None) is not None:
+                logger.info("[SCENE] Rebuilding degraded cached context for %s…", cached.image_hash[:8])
+                cache.invalidate(image)
+            else:
+                return cached
         return cache.get_or_build(image, builder)
     except Exception as exc:
         logger.warning("[SCENE] Context build failed (%s) — returning empty context.", exc)
@@ -150,13 +163,22 @@ def _planner_class_from_label(label: str) -> str:
     return canonical_object_class(label)
 
 
+def _working_dims(image_shape: tuple[int, int, int]) -> tuple[int, int]:
+    h, w = image_shape[:2]
+    max_size = int(config.inference.max_image_size)
+    if max(h, w) <= max_size:
+        return w, h
+    scale = max_size / float(max(h, w))
+    return max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+
+
 def _build_add_request(
     object_class: str,
     size_multiplier: float,
     target_position: tuple[int, int],
     image_shape: tuple[int, int, int],
 ) -> PlacementRequest:
-    h, w = image_shape[:2]
+    w, h = _working_dims(image_shape)
     canonical_class = canonical_object_class(object_class)
     size_prior = object_size_for(canonical_class)
     scaled_size = tuple(float(v) * max(0.25, float(size_multiplier)) for v in size_prior)
@@ -384,6 +406,7 @@ def _render_scene_inspector(ctx: SceneContext) -> tuple[np.ndarray, str]:
 
     # Summary text
     intrinsics = ctx.camera_intrinsics_estimate
+    meta = ctx.metadata or {}
     f_str = f"{intrinsics['f_px']:.1f} px" if intrinsics else "n/a"
     floor_pct = (ctx.floor_mask.sum() / (h * w) * 100) if ctx.floor_mask is not None else 0
     occ_pct = (ctx.occupancy_mask.astype(bool).sum() / (h * w) * 100
@@ -391,6 +414,7 @@ def _render_scene_inspector(ctx: SceneContext) -> tuple[np.ndarray, str]:
     summary_lines = [
         f"Image: {w}×{h}  |  Hash: {ctx.image_hash[:12]}…",
         f"Masks (SAM): {len(ctx.panoptic_masks)}  |  Labeled: {len(ctx.panoptic_labels)}",
+        f"Label mode: {meta.get('label_mode', 'n/a')}  |  Depth available: {'yes' if meta.get('depth_available') else 'no'}",
         f"Floor coverage: {floor_pct:.1f}%  |  Furniture coverage: {occ_pct:.1f}%",
         f"Wall regions: {len(ctx.wall_masks)}",
         f"Vanishing points: {len(ctx.vanishing_points)}" +
