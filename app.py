@@ -40,12 +40,29 @@ from pipeline.nl_parser import parse_nl
 from pipeline.placement_planner import PlacementRequest
 from pipeline.scene_context import SceneContext, SceneContextBuilder
 from pipeline.scene_cache import get_scene_cache
-from utils.image_utils import ensure_rgb
+from utils.image_utils import ensure_rgb, resize_long_edge
 from utils.depth_utils import depth_colourmap
 
-DEFAULT_CATALOG_DIR = Path(__file__).parent / "data" / "catalog"
-EXTERNAL_CATALOG_DIR = Path(__file__).parent / "Furniture_images"
-CATALOG_DIR = EXTERNAL_CATALOG_DIR if EXTERNAL_CATALOG_DIR.exists() else DEFAULT_CATALOG_DIR
+DEFAULT_CATALOG_DIR   = Path(__file__).parent / "data" / "catalog"
+EXTERNAL_CATALOG_DIR  = Path(__file__).parent / "Furniture_images"
+PROCESSED_CATALOG_DIR = Path(__file__).parent / "Furniture_images_processed"
+
+def _pick_catalog_dir() -> Path:
+    # Prefer the pre-processed folder (clean alpha cutouts) when it has images.
+    if PROCESSED_CATALOG_DIR.exists():
+        has_images = any(
+            p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            for p in PROCESSED_CATALOG_DIR.iterdir()
+            if p.is_file() and not p.name.startswith(".")
+        )
+        if has_images:
+            return PROCESSED_CATALOG_DIR
+    if EXTERNAL_CATALOG_DIR.exists():
+        return EXTERNAL_CATALOG_DIR
+    return DEFAULT_CATALOG_DIR
+
+CATALOG_DIR = _pick_catalog_dir()
+print(f"[ReScene] Catalog directory: {CATALOG_DIR}")
 EXAMPLES_DIR = Path(__file__).parent / "data" / "examples" / "output"
 _CATALOG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
@@ -115,22 +132,109 @@ def _get_scene_builder() -> SceneContextBuilder:
 
 def _scene_ctx_is_degraded(ctx: SceneContext) -> bool:
     meta = ctx.metadata or {}
+    if meta.get("resource_limited"):
+        return False
     return (not bool(meta.get("sam_available"))) or (not bool(meta.get("depth_available")))
+
+
+def _prepare_scene_image(image: np.ndarray) -> np.ndarray:
+    rgb = ensure_rgb(image)
+    return resize_long_edge(rgb, int(config.scene.analysis_max_image_size))
+
+
+def _scene_runtime_warnings(ctx: SceneContext) -> list[str]:
+    meta = ctx.metadata or {}
+    warnings: list[str] = []
+    if meta.get("sam_oom"):
+        warnings.append(
+            "CUDA OOM: SAM scene segmentation fell back or was skipped. Restart the app or use a smaller image if you need full scene masks."
+        )
+    elif meta.get("sam_available") is False:
+        warnings.append("SAM scene segmentation is unavailable; object masks in Scene Inspector are incomplete.")
+
+    if meta.get("depth_oom"):
+        warnings.append(
+            "CUDA OOM: ZoeDepth switched off GPU. Depth-aware placement still ran in degraded mode."
+        )
+    elif meta.get("depth_available") is False:
+        warnings.append("Depth estimation is unavailable; planner scaling and scene geometry are degraded.")
+
+    if meta.get("label_mode") != "clip":
+        clip_error = meta.get("clip_error")
+        if clip_error:
+            warnings.append(f"CLIP labels unavailable; using heuristic labels instead. ({clip_error})")
+        else:
+            warnings.append("CLIP labels unavailable; using heuristic labels instead.")
+    return warnings
+
+
+def _append_status_warnings(status: str, warnings: list[str]) -> str:
+    if not warnings:
+        return status
+    return status + "\n" + "\n".join(f"WARNING: {line}" for line in warnings)
+
+
+def _format_runtime_error(prefix: str, exc: Exception) -> str:
+    msg = str(exc)
+    if "out of memory" in msg.lower() and "cuda" in msg.lower():
+        return (
+            f"{prefix}: CUDA ran out of memory. The app may continue in CPU/degraded mode, "
+            "but a full restart is recommended before retrying heavy scene analysis."
+        )
+    return f"{prefix}: {exc}"
+
+
+def _editor_value_for_image(image: np.ndarray | None) -> dict[str, Any] | None:
+    if image is None:
+        return None
+    rgb = ensure_rgb(image)
+    return {"background": rgb, "layers": [], "composite": rgb}
+
+
+def _mask_from_editor_value(editor_value: Any, shape: tuple[int, int]) -> np.ndarray | None:
+    if not isinstance(editor_value, dict):
+        return None
+    layers = editor_value.get("layers") or []
+    if not layers:
+        return None
+
+    h, w = shape
+    combined = np.zeros((h, w), dtype=np.uint8)
+    for layer in layers:
+        if layer is None:
+            continue
+        arr = np.asarray(layer)
+        if arr.ndim == 2:
+            layer_mask = arr > 0
+        elif arr.ndim == 3 and arr.shape[2] >= 4:
+            layer_mask = arr[:, :, 3] > 0
+        elif arr.ndim == 3:
+            layer_mask = arr[:, :, :3].sum(axis=2) > 0
+        else:
+            continue
+        if layer_mask.shape != (h, w):
+            layer_mask = cv2.resize(
+                layer_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+            ) > 0
+        combined[layer_mask] = 255
+
+    return combined if combined.any() else None
 
 
 def _build_scene_ctx_safe(image: np.ndarray) -> SceneContext:
     """Build (or return cached) SceneContext for *image*. Never raises."""
     try:
+        scene_image = _prepare_scene_image(image)
         cache = get_scene_cache()
         builder = _get_scene_builder()
-        cached = cache.get(image)
+        cached = cache.get(scene_image)
         if cached is not None:
             if _scene_ctx_is_degraded(cached) and getattr(builder, "_mm", None) is not None:
                 logger.info("[SCENE] Rebuilding degraded cached context for %s…", cached.image_hash[:8])
-                cache.invalidate(image)
+                cache.invalidate(scene_image)
             else:
                 return cached
-        return cache.get_or_build(image, builder)
+        return cache.get_or_build(scene_image, builder)
     except Exception as exc:
         logger.warning("[SCENE] Context build failed (%s) — returning empty context.", exc)
         import hashlib
@@ -424,6 +528,10 @@ def _render_scene_inspector(ctx: SceneContext) -> tuple[np.ndarray, str]:
         f"Anchor candidates: {len(ctx.anchor_candidates)}",
         f"Depth map: {'yes' if ctx.depth_map is not None else 'no'}",
     ]
+    warn_lines = _scene_runtime_warnings(ctx)
+    if warn_lines:
+        summary_lines.append("Warnings:")
+        summary_lines.extend(f"- {line}" for line in warn_lines)
     return result_rgb, "\n".join(summary_lines)
 
 
@@ -442,10 +550,16 @@ def _load_examples() -> list[tuple[np.ndarray, str]]:
 # Remove tab handlers
 # ---------------------------------------------------------------------------
 
-def on_room_upload(image: np.ndarray | None) -> tuple[Any, Any, str]:
+def on_room_upload(image: np.ndarray | None) -> tuple[Any, Any, Any, str]:
     if image is None:
-        return None, None, "Upload a room photo to begin."
-    return ensure_rgb(image), None, "Click on the object you want to remove."
+        return None, None, None, "Upload a room photo to begin."
+    rgb = ensure_rgb(image)
+    return (
+        rgb,
+        None,
+        _editor_value_for_image(rgb),
+        "Click the object you want to remove, or paint the mask yourself below.",
+    )
 
 
 def on_click_select(
@@ -465,34 +579,38 @@ def on_click_select(
                 "Click again to reselect, or press 'Remove Object'.")
     except Exception as exc:
         logger.exception("select_object failed")
-        return ensure_rgb(image), None, f"Selection failed: {exc}"
+        return ensure_rgb(image), None, _format_runtime_error("Selection failed", exc)
 
 
 def on_remove(
     image: np.ndarray | None,
     mask_state: np.ndarray | None,
+    editor_value: Any,
     style_after: str = "None",
 ) -> tuple[np.ndarray | None, np.ndarray | None, str]:
     if image is None:
         return None, None, "Please upload an image first."
-    if mask_state is None:
-        return None, None, "Please click on an object to select it first."
     try:
         t0 = time.perf_counter()
         rgb = ensure_rgb(image)
-        result = _orch().remove(image=rgb, object_mask=mask_state)
+        manual_mask = _mask_from_editor_value(editor_value, rgb.shape[:2])
+        object_mask = manual_mask if manual_mask is not None else mask_state
+        if object_mask is None:
+            return None, None, "Click an object to select it, or paint a mask manually first."
+        result = _orch().remove(image=rgb, object_mask=object_mask)
         if style_after and style_after != "None":
             result = _orch().restyle(image=result, style_name=style_after)
         elapsed = time.perf_counter() - t0
         before = _make_before_after(rgb, result)
+        removal_mode = "manual mask" if manual_mask is not None else "SAM selection"
         status = _fmt_status(
-            f"Object removed." + (f"  Mood shift: {style_after}." if style_after != "None" else ""),
+            f"Object removed via {removal_mode}." + (f"  Mood shift: {style_after}." if style_after != "None" else ""),
             elapsed,
         )
         return result, before, status
     except Exception as exc:
         logger.exception("remove failed")
-        return None, None, f"Error: {exc}"
+        return None, None, _format_runtime_error("Error", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -575,7 +693,7 @@ def on_move_execute(
         return result, comparison, status
     except Exception as exc:
         logger.exception("move execute failed")
-        return None, None, f"Error: {exc}"
+        return None, None, _format_runtime_error("Error", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -584,13 +702,14 @@ def on_move_execute(
 
 def on_add_room_upload(room_img: np.ndarray | None) -> tuple:
     if room_img is None:
-        return None, None, (1.0, 1.0), "Upload a room photo to begin."
+        return None, None, None, (1.0, 1.0), "Upload a room photo to begin."
     rgb = ensure_rgb(room_img)
     h, w = rgb.shape[:2]
     max_size = config.inference.max_image_size
     scale = min(1.0, max_size / max(h, w))
-    return (rgb, rgb, (scale, scale),
+    return (rgb, rgb, rgb, (scale, scale),
             "Room uploaded.  Step 2 — choose furniture.  Step 3 — click to set position.")
+    # outputs: add_room, add_original_state, add_base_state, add_scale_state, add_status
 
 
 def on_add_catalog_select(choice: str) -> tuple:
@@ -649,62 +768,66 @@ def on_add_room_click(
 
 def on_add_execute(
     add_original: np.ndarray | None,
+    add_base: np.ndarray | None,
     add_furn: Any,
     add_target: tuple | None,
-    add_object_class: str,
     add_size_multiplier: float,
-    add_show_heatmap: bool,
     style_after: str = "None",
 ) -> tuple:
+    # outputs: add_result, add_room, add_original_state, add_target_state,
+    #          add_comparison, add_status, add_plan_overlay, add_plan_reasoning, add_heatmap
+    # NOTE: gr.update() only works for visual components; for gr.State outputs always
+    # return the actual value (pass current value through on error).
+    _room_nc = gr.update()  # no-change for the Image display component
     if add_original is None:
-        return None, None, "Upload a room image first.", None, "", None
+        return None, _room_nc, add_original, add_target, None, "Upload a room image first.", None, "", None
     if add_furn is None:
-        return None, None, "Select or upload a furniture image.", None, "", None
+        return None, _room_nc, add_original, add_target, None, "Select or upload a furniture image.", None, "", None
     if add_target is None:
-        return None, None, "Click the room to set the insertion point.", None, "", None
+        return None, _room_nc, add_original, add_target, None, "Click the room to set the insertion point.", None, "", None
     tx, ty = add_target
     try:
         t0 = time.perf_counter()
         rgb_add = ensure_rgb(add_original)
-        scene_ctx = _build_scene_ctx_safe(rgb_add)
-        placement_request = _build_add_request(
-            add_object_class, add_size_multiplier, (tx, ty), rgb_add.shape
-        )
-        plan_result = _orch().plan_add_placement(
-            scene_ctx,
-            add_object_class,
-            placement_request.location_hint,
-            size_multiplier=add_size_multiplier,
-        )
+        # Always build scene context from the original clean room so depth/floor
+        # analysis is not confused by previously composited furniture.
+        rgb_base = ensure_rgb(add_base) if add_base is not None else rgb_add
+        scene_ctx = _build_scene_ctx_safe(rgb_base)
         result = _orch().add(image=rgb_add, furniture_image=add_furn,
                              target_position=(tx, ty),
                              size_multiplier=float(add_size_multiplier),
-                             scene_context=scene_ctx,
-                             object_class=add_object_class,
-                             placement_request=placement_request)
+                             scene_context=scene_ctx)
         if style_after and style_after != "None":
             result = _orch().restyle(image=result, style_name=style_after)
         elapsed = time.perf_counter() - t0
-        comparison = _make_before_after(rgb_add, result)
-        plan_overlay = _render_planner_overlay(
-            rgb_add,
-            plan_result.footprint_mask,
-            plan_result.clearance_mask,
-            plan_result.position_px,
-        )
-        heatmap = None
-        if add_show_heatmap and plan_result.score_heatmap is not None:
-            heatmap = cv2.cvtColor(plan_result.score_heatmap, cv2.COLOR_BGR2RGB)
+        comparison = _make_before_after(rgb_base, result)
         status = _fmt_status(
-            f"Furniture added at planned anchor ({plan_result.position_px[0]}, {plan_result.position_px[1]}) "
-            f"with size ×{add_size_multiplier:.2f}."
-            + (f"  Mood shift: {style_after}." if style_after != "None" else ""),
+            f"Furniture added at click ({tx}, {ty}) with size ×{add_size_multiplier:.2f}."
+            + (f"  Mood shift: {style_after}." if style_after != "None" else "")
+            + "  Pick more furniture and click again to keep adding.",
             elapsed,
         )
-        return result, comparison, status, plan_overlay, plan_result.reasoning, heatmap
+        status = _append_status_warnings(status, _scene_runtime_warnings(scene_ctx))
+        return result, result, result, None, comparison, status, None, "", None
     except Exception as exc:
         logger.exception("add failed")
-        return None, None, f"Error: {exc}", None, "", None
+        return None, gr.update(), add_original, add_target, None, _format_runtime_error("Error", exc), None, "", None
+
+
+def on_add_reset(base_image: np.ndarray | None) -> tuple:
+    """Restore the room canvas to the originally uploaded image."""
+    if base_image is None:
+        return None, None, None, "Upload a room photo first."
+    return base_image, base_image, None, "Canvas reset — all additions cleared.  Click to place furniture."
+    # outputs: add_room, add_original_state, add_target_state, add_status
+
+
+def on_refresh_catalog() -> Any:
+    """Reload catalog choices from disk, re-evaluating which folder to use."""
+    global CATALOG_DIR
+    CATALOG_DIR = _pick_catalog_dir()
+    choices = ["(upload instead)"] + _list_catalog()
+    return gr.update(choices=choices, value=choices[0])
 
 
 # ---------------------------------------------------------------------------
@@ -896,10 +1019,11 @@ def handle_scene_inspector(
             f"Anchors: {len(ctx.anchor_candidates)}.",
             elapsed,
         )
+        status = _append_status_warnings(status, _scene_runtime_warnings(ctx))
         return overlay, summary, status
     except Exception as exc:
         logger.exception("scene inspector failed")
-        return None, "", f"Error: {exc}"
+        return None, "", _format_runtime_error("Error", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -960,7 +1084,7 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "### Remove an object from the room\n"
                 "**Step 1** Upload a photo.  "
-                "**Step 2** Click the object (SAM highlights it).  "
+                "**Step 2** Click the object (SAM highlights it) or paint the mask manually.  "
                 "**Step 3** Press *Remove Object*."
             )
             rm_mask_state = gr.State(None)
@@ -970,6 +1094,21 @@ def build_ui() -> gr.Blocks:
                                        type="numpy", height=420, sources=["upload"])
                     rm_overlay = gr.Image(label="Selection preview",
                                           type="numpy", height=420, interactive=False)
+                    rm_mask_editor = gr.ImageEditor(
+                        label="Manual remove mask (optional) — paint over the object",
+                        type="numpy",
+                        height=320,
+                        interactive=True,
+                        brush=gr.Brush(
+                            default_size=28,
+                            colors=["rgb(220, 60, 60)"],
+                            default_color="rgb(220, 60, 60)",
+                            color_mode="fixed",
+                        ),
+                        eraser=gr.Eraser(default_size=24),
+                        transforms=(),
+                        layers=True,
+                    )
                     rm_status = gr.Textbox(label="Status",
                                            value="Upload a room photo to begin.",
                                            interactive=False, lines=2)
@@ -984,12 +1123,12 @@ def build_ui() -> gr.Blocks:
                                              height=420, interactive=False)
 
             rm_room.upload(fn=on_room_upload, inputs=[rm_room],
-                           outputs=[rm_overlay, rm_mask_state, rm_status])
+                           outputs=[rm_overlay, rm_mask_state, rm_mask_editor, rm_status])
             rm_room.select(fn=on_click_select, inputs=[rm_room, rm_mask_state],
                            outputs=[rm_overlay, rm_mask_state, rm_status])
             rm_overlay.select(fn=on_click_select, inputs=[rm_room, rm_mask_state],
                               outputs=[rm_overlay, rm_mask_state, rm_status])
-            rm_btn.click(fn=on_remove, inputs=[rm_room, rm_mask_state, rm_style_after],
+            rm_btn.click(fn=on_remove, inputs=[rm_room, rm_mask_state, rm_mask_editor, rm_style_after],
                          outputs=[rm_result, rm_comparison, rm_status])
 
         # ── Tab 2: Move ───────────────────────────────────────────────────
@@ -1047,9 +1186,11 @@ def build_ui() -> gr.Blocks:
             gr.Markdown(
                 "### Insert furniture into the scene\n"
                 "**Step 1** Upload room.  **Step 2** Pick/upload furniture.  "
-                "**Step 3** Click insertion point.  **Step 4** Add."
+                "**Step 3** Click insertion point.  **Step 4** Add.  "
+                "**Repeat Steps 2–4** to keep stacking items — the result becomes your new canvas."
             )
-            add_original_state = gr.State(None)
+            add_original_state = gr.State(None)   # current canvas (accumulates additions)
+            add_base_state     = gr.State(None)   # original clean room (never changes per upload)
             add_scale_state    = gr.State((1.0, 1.0))
             add_target_state   = gr.State(None)
             add_furn_state     = gr.State(None)
@@ -1060,11 +1201,17 @@ def build_ui() -> gr.Blocks:
                     add_status = gr.Textbox(label="Status",
                                             value="Upload a room photo to begin.",
                                             interactive=False, lines=2)
-                    gr.Markdown("**Step 2: Furniture source**")
+                    with gr.Row():
+                        add_btn = gr.Button("Add Furniture", variant="primary")
+                        add_reset_btn = gr.Button("Reset canvas", variant="secondary")
+                    gr.Markdown("**Furniture source**")
                     _catalog_choices = ["(upload instead)"] + _list_catalog()
-                    add_catalog = gr.Dropdown(choices=_catalog_choices,
-                                              value=_catalog_choices[0],
-                                              label="Pick from catalog")
+                    with gr.Row():
+                        add_catalog = gr.Dropdown(choices=_catalog_choices,
+                                                  value=_catalog_choices[0],
+                                                  label="Pick from catalog",
+                                                  scale=3)
+                        add_refresh_btn = gr.Button("↺ Refresh", scale=1, size="sm")
                     add_furn = gr.Image(
                         label="— or upload a product photo (PNG preferred)",
                         type="numpy", height=180, sources=["upload"])
@@ -1074,25 +1221,20 @@ def build_ui() -> gr.Blocks:
                         label="Furniture Class (planner)",
                     )
                     add_size = gr.Slider(
-                        minimum=0.6,
+                        minimum=0.1,
                         maximum=2.6,
-                        value=1.35,
+                        value=1.0,
                         step=0.05,
                         label="Furniture Size Multiplier",
-                        info="Increase this when the inserted furniture looks too small for the room.",
-                    )
-                    add_show_heatmap = gr.Checkbox(
-                        value=False,
-                        label="Debug: show planner scoring heatmap",
+                        info="Drag left for smaller, right for larger. Default 1.0 = real-world scale.",
                     )
                     add_style_after = gr.Dropdown(
                         choices=["None"] + style_choices, value="None",
                         label="Apply mood shift after add (optional)")
-                    add_btn = gr.Button("Add Furniture", variant="primary", size="lg")
                 with gr.Column(scale=1):
                     add_result     = gr.Image(label="Result", type="numpy",
                                               height=400, interactive=False)
-                    add_comparison = gr.Image(label="Before / After", type="numpy",
+                    add_comparison = gr.Image(label="Before / After (vs. original room)", type="numpy",
                                               height=400, interactive=False)
                     add_plan_overlay = gr.Image(label="Planner footprint preview", type="numpy",
                                                 height=220, interactive=False)
@@ -1101,21 +1243,25 @@ def build_ui() -> gr.Blocks:
                                            height=220, interactive=False)
 
             add_room.upload(fn=on_add_room_upload, inputs=[add_room],
-                            outputs=[add_room, add_original_state,
+                            outputs=[add_room, add_original_state, add_base_state,
                                      add_scale_state, add_status])
             add_room.select(fn=on_add_room_click,
                             inputs=[add_original_state, add_scale_state],
                             outputs=[add_room, add_target_state, add_status])
             add_catalog.change(fn=on_add_catalog_select, inputs=[add_catalog],
                                outputs=[add_furn, add_furn_state, add_status, add_object_class])
+            add_refresh_btn.click(fn=on_refresh_catalog, inputs=[],
+                                  outputs=[add_catalog])
             add_furn.upload(fn=on_add_furn_upload, inputs=[add_furn],
                             outputs=[add_furn_state, add_status])
             add_btn.click(fn=on_add_execute,
-                          inputs=[add_original_state, add_furn_state,
-                                   add_target_state, add_object_class, add_size,
-                                   add_show_heatmap, add_style_after],
-                          outputs=[add_result, add_comparison, add_status,
+                          inputs=[add_original_state, add_base_state, add_furn_state,
+                                  add_target_state, add_size, add_style_after],
+                          outputs=[add_result, add_room, add_original_state, add_target_state,
+                                   add_comparison, add_status,
                                    add_plan_overlay, add_plan_reasoning, add_heatmap])
+            add_reset_btn.click(fn=on_add_reset, inputs=[add_base_state],
+                                outputs=[add_room, add_original_state, add_target_state, add_status])
 
         # ── Tab 4: Mood Shift ─────────────────────────────────────────────
         with gr.Tab("Mood Shift"):
@@ -1257,9 +1403,9 @@ def build_ui() -> gr.Blocks:
                 "Uploads the room to the SAM → ZoeDepth → CLIP pipeline and "
                 "shows the derived floor / wall / furniture masks, vanishing points, "
                 "camera intrinsics estimate, and anchor candidates.\n\n"
-                "> **Note:** Full analysis requires SAM and ZoeDepth weights. "
-                "Without weights, heuristic fallbacks are used (position-based "
-                "floor/wall masks, no depth)."
+                f"> **Analysis resolution:** long edge capped at {config.scene.analysis_max_image_size}px for stability.\n"
+                "> **Warnings:** the status box will explicitly tell you if CUDA OOM forced degraded analysis "
+                "or if CLIP labels fell back to heuristics."
             )
             with gr.Row():
                 with gr.Column(scale=1):

@@ -132,13 +132,15 @@ class PipelineOrchestrator:
             lbls += (point_labels or [1] * len(additional_points))
 
         seg = self._mm.get("sam")
-        seg_result = seg.predict(
-            image=processed,
-            points=pts,
-            point_labels=lbls,
-            automatic=False,
-        )
-        self._mm.unload_current()
+        try:
+            seg_result = seg.predict(
+                image=processed,
+                points=pts,
+                point_labels=lbls,
+                automatic=False,
+            )
+        finally:
+            self._mm.unload_current()
 
         # Pick the best mask: highest score among masks with reasonable area
         masks = seg_result["masks"]
@@ -319,8 +321,6 @@ class PipelineOrchestrator:
         size_multiplier: float = 1.0,
         scene_context: SceneContext | None = None,
         object_class: str | None = None,
-        placement_request: PlacementRequest | None = None,
-        occupancy_tracker: OccupancyTracker | None = None,
     ) -> np.ndarray:
         """Insert a furniture item into the scene at *target_position*.
 
@@ -351,38 +351,13 @@ class PipelineOrchestrator:
             furniture_rgba = furniture_image.copy()
         furniture_rgba = _crop_rgba_to_alpha(furniture_rgba)
 
-        plan_result: PlacementResult | None = None
-        plan_request = placement_request
-        tracker = occupancy_tracker
         tx, ty = int(np.clip(target_position[0], 0, w - 1)), int(np.clip(target_position[1], 0, h - 1))
 
-        if self._use_v2_planner and scene_context is not None and self._placement_planner is not None:
-            scaled_scene = _resize_scene_context(scene_context, (h, w))
-            tracker = tracker or OccupancyTracker(scaled_scene)
-            if plan_request is None:
-                canonical_class = canonical_object_class(object_class)
-                size_prior = object_size_for(canonical_class)
-                scaled_size = tuple(float(v) * max(0.25, float(size_multiplier)) for v in size_prior)
-                plan_request = PlacementRequest(
-                    object_class=canonical_class,
-                    object_size_estimate=scaled_size,
-                    location_hint=(tx / max(w, 1), ty / max(h, 1)),
-                )
-            else:
-                plan_request = PlacementRequest(
-                    object_class=canonical_object_class(plan_request.object_class),
-                    object_size_estimate=tuple(float(v) for v in plan_request.object_size_estimate),
-                    location_hint=plan_request.location_hint,
-                    clearance_required=plan_request.clearance_required,
-                )
-            plan_result = self._placement_planner.plan(tracker.scene, plan_request)
-            tx, ty = plan_result.position_px
-
-        # Step 1: Depth estimation for scale (reuse cached depth if available)
-        if plan_result is not None:
-            depth_map = tracker.scene.depth_map if tracker is not None else None
-            scale_factor = float(plan_result.scale_factor)
-        elif scene_context is not None and scene_context.depth_map is not None:
+        # Step 1: Depth estimation for scale at the user's click position.
+        # The planner is not used here — it runs separately in plan_add_placement()
+        # for the overlay preview only.  Using the planner inside add() caused
+        # it to override the user's click with its own chosen position.
+        if scene_context is not None and scene_context.depth_map is not None:
             depth_map = cv2.resize(
                 scene_context.depth_map, (w, h), interpolation=cv2.INTER_LINEAR
             )
@@ -398,11 +373,7 @@ class PipelineOrchestrator:
 
         # Step 2: Perspective warp furniture
         fw, fh = furniture_rgba.shape[1], furniture_rgba.shape[0]
-        if plan_result is not None and plan_request is not None:
-            desired_height_px = max(8, int(round(plan_request.object_size_estimate[2] * plan_result.scale_factor)))
-            target_size = (max(int(round(desired_height_px * fw / max(fh, 1))), 4), desired_height_px)
-        else:
-            target_size = (max(int(fw * scale_factor), 4), max(int(fh * scale_factor), 4))
+        target_size = (max(int(fw * scale_factor), 4), max(int(fh * scale_factor), 4))
         h_p = min(h, max(8, int(h * 0.3)))
         w_p = min(w, max(8, int(w * 0.3)))
         scene_patch = image[
@@ -418,10 +389,8 @@ class PipelineOrchestrator:
         )
         self._mm.unload_current()
 
-        # Step 3: Composite
-        paste_position = (tx, ty)
-        if plan_result is not None:
-            paste_position = (tx, max(0, ty - warped_rgba.shape[0] // 2))
+        # Step 3: Composite — anchor the furniture's bottom-centre at (tx, ty)
+        paste_position = (tx, max(0, ty - warped_rgba.shape[0] // 2))
         result, obj_mask = paste_with_mask(image, warped_rgba, paste_position)
 
         # Step 3.5: Colour-match the inserted object to its surroundings
@@ -436,9 +405,6 @@ class PipelineOrchestrator:
         harmonizer = self._mm.get("iharmony4")
         result = harmonizer.predict(composite=result, foreground_mask=obj_mask)
         self._mm.unload_current()
-
-        if tracker is not None and plan_result is not None:
-            tracker.reserve(plan_result.footprint_mask)
 
         logger.info("[ADD] Done.")
         return result
@@ -596,14 +562,9 @@ class PipelineOrchestrator:
             elif op == "move":
                 result = self.move(result, **kw)
             elif op == "add":
-                scene_ctx = kw.get("scene_context")
-                if self._use_v2_planner and scene_ctx is not None:
-                    scaled_scene = _resize_scene_context(scene_ctx, _prep(result, self._cfg).shape[:2])
-                    if occupancy_tracker is None or occupancy_hash != scaled_scene.image_hash:
-                        occupancy_tracker = OccupancyTracker(scaled_scene)
-                        occupancy_hash = scaled_scene.image_hash
-                    kw["scene_context"] = occupancy_tracker.scene
-                    kw["occupancy_tracker"] = occupancy_tracker
+                # Strip keys that are no longer part of add()'s signature
+                kw.pop("placement_request", None)
+                kw.pop("occupancy_tracker", None)
                 result = self.add(result, **kw)
             elif op == "restyle":
                 result = self.restyle(result, **kw)
@@ -824,7 +785,7 @@ def _color_match_composite(
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
     obj_crop = composite[y0:y1, x0:x1].copy()
-    matched_crop = simple_color_match(obj_crop, background, bg_sample_mask)
+    matched_crop = simple_color_match(obj_crop, background, bg_sample_mask, strength=0.35)
 
     # Blend using the soft object mask (not hard binary) for smooth edges
     soft_alpha = (obj_mask[y0:y1, x0:x1].astype(np.float32) / 255.0)[:, :, None]

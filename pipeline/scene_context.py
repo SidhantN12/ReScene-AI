@@ -113,23 +113,30 @@ class SceneContextBuilder:
         meta: dict[str, Any] = {}
 
         # 1. SAM
-        masks, sam_ok = self._run_sam(image)
+        masks, sam_ok, sam_error, sam_oom = self._run_sam(image)
         ctx.panoptic_masks = masks
         meta["sam_available"] = sam_ok
         meta["sam_mask_count"] = len(masks)
+        meta["sam_error"] = sam_error
+        meta["sam_oom"] = sam_oom
 
         # 2. ZoeDepth
-        depth, depth_ok = self._run_zoedepth(image)
+        depth, depth_ok, depth_error, depth_oom = self._run_zoedepth(image)
         ctx.depth_map = depth
         meta["depth_available"] = depth_ok
+        meta["depth_error"] = depth_error
+        meta["depth_oom"] = depth_oom
 
         # 3. Classify masks → semantic labels
         if masks:
-            labels, label_mode = self._classify_masks(image, masks)
+            labels, label_mode, clip_error = self._classify_masks(image, masks)
         else:
-            labels, label_mode = {}, "none"
+            labels, label_mode, clip_error = {}, "none", ""
         ctx.panoptic_labels = labels
         meta["label_mode"] = label_mode
+        meta["clip_error"] = clip_error
+        meta["analysis_shape"] = list(image.shape[:2])
+        meta["resource_limited"] = bool(sam_oom or depth_oom)
 
         # 4. Derive structural / occupancy masks
         self._derive_structural_masks(ctx, image.shape[:2])
@@ -156,31 +163,35 @@ class SceneContextBuilder:
     # Stage 1: SAM
     # ------------------------------------------------------------------
 
-    def _run_sam(self, image: np.ndarray) -> tuple[dict[int, np.ndarray], bool]:
+    def _run_sam(self, image: np.ndarray) -> tuple[dict[int, np.ndarray], bool, str, bool]:
         if self._mm is None:
-            return {}, False
+            return {}, False, "model manager unavailable", False
         try:
             seg = self._mm.get("sam")
-            result = seg.predict(image=image, automatic=True)
-            self._mm.unload_current()
+            try:
+                result = seg.predict(image=image, automatic=True)
+            finally:
+                self._mm.unload_current()
             masks_list: list[np.ndarray] = result.get("masks", [])
             masks = {i: m.astype(bool) for i, m in enumerate(masks_list)}
-            return masks, True
+            return masks, True, "", False
         except Exception as exc:
             logger.warning("[SCENE] SAM unavailable (%s) — skipping.", exc)
-            return {}, False
+            return {}, False, str(exc), _is_cuda_oom_message(exc)
 
     # ------------------------------------------------------------------
     # Stage 2: ZoeDepth
     # ------------------------------------------------------------------
 
-    def _run_zoedepth(self, image: np.ndarray) -> tuple[np.ndarray | None, bool]:
+    def _run_zoedepth(self, image: np.ndarray) -> tuple[np.ndarray | None, bool, str, bool]:
         if self._mm is None:
-            return None, False
+            return None, False, "model manager unavailable", False
         try:
             zoedepth = self._mm.get("zoedepth")
-            depth = zoedepth.predict(image=image)          # H×W float32 metres
-            self._mm.unload_current()
+            try:
+                depth = zoedepth.predict(image=image)          # H×W float32 metres
+            finally:
+                self._mm.unload_current()
             if isinstance(depth, dict):
                 depth = depth.get("depth_map", depth.get("depth"))
             depth = np.asarray(depth, dtype=np.float32)
@@ -188,10 +199,10 @@ class SceneContextBuilder:
             h, w = image.shape[:2]
             if depth.shape != (h, w):
                 depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-            return depth, True
+            return depth, True, "", False
         except Exception as exc:
             logger.warning("[SCENE] ZoeDepth unavailable (%s) — skipping.", exc)
-            return None, False
+            return None, False, str(exc), _is_cuda_oom_message(exc)
 
     # ------------------------------------------------------------------
     # Stage 3: CLIP zero-shot classification
@@ -199,12 +210,12 @@ class SceneContextBuilder:
 
     def _classify_masks(
         self, image: np.ndarray, masks: dict[int, np.ndarray]
-    ) -> tuple[dict[int, str], str]:
+    ) -> tuple[dict[int, str], str, str]:
         try:
-            return self._clip_classify(image, masks), "clip"
+            return self._clip_classify(image, masks), "clip", ""
         except Exception as exc:
             logger.warning("[SCENE] CLIP unavailable (%s) — using heuristic labels.", exc)
-            return self._heuristic_classify(image, masks), "heuristic"
+            return self._heuristic_classify(image, masks), "heuristic", str(exc)
 
     def _clip_classify(
         self, image: np.ndarray, masks: dict[int, np.ndarray]
@@ -556,6 +567,11 @@ def _resolve_local_clip_assets() -> tuple[str, str, str]:
         )
 
     return str(processor_dir), str(config_dir), str(weights_file)
+
+
+def _is_cuda_oom_message(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg and "cuda" in msg
 
 
 # ---------------------------------------------------------------------------

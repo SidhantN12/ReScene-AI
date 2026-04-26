@@ -47,14 +47,13 @@ class DownloadResult:
 
 MODELS: list[ModelEntry] = [
     ModelEntry(
-        name="SAM ViT-H",
-        dest=Path("sam_vit_h_4b8939.pth"),
-        url="https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+        name="SAM ViT-B",
+        dest=Path("sam_vit_b_01ec64.pth"),
+        url="https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
         category="required",
         required=True,
-        # Correct hash observed from the official SAM checkpoint download.
-        sha256="a7bf3b02f3ebf1267aba913ff637d9a2d5c33d3173bb679e46d9f338c26f262e",
-        notes="Used by Remove, Move selection, scene understanding, and optional Restyle segmentation.",
+        sha256="ec2df62732614e57411cdcf32a23ffdf28910380d03139ee0f4fcbe91eb8c912",
+        notes="Used by Remove, Move selection, scene understanding, and optional Restyle segmentation. ViT-B is now preferred to reduce VRAM pressure.",
     ),
     ModelEntry(
         name="ZoeDepth ZoeD_NK",
@@ -68,13 +67,13 @@ MODELS: list[ModelEntry] = [
     ),
     ModelEntry(
         name="LaMa big-lama",
-        dest=Path("lama"),
+        dest=Path("lama") / "big-lama.pt",
         url=None,
         category="optional",
         required=False,
         notes=(
-            "Not downloaded here. Runtime uses simple-lama-inpainting, which fetches "
-            "big-lama into its own cache on first use. Remove/Move fall back to OpenCV if absent."
+            "Runtime now prefers models/lama/big-lama.pt when present, otherwise it can "
+            "reuse simple-lama-inpainting's torch hub cache. Remove/Move fall back to OpenCV if absent."
         ),
     ),
     ModelEntry(

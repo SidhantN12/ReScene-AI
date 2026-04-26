@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Maximum top-edge compression ratio (15 % per side at deepest scene depth)
 _MAX_TOP_SQUEEZE = 0.15
 # Blend strength for colour transfer into the object (0 = no transfer, 1 = full)
-_COLOR_TRANSFER_STRENGTH = 0.55
+_COLOR_TRANSFER_STRENGTH = 0.25
 
 
 class PerspectiveWarpWrapper:
@@ -59,7 +59,10 @@ class PerspectiveWarpWrapper:
     def unload(self) -> None:
         self._model = None
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError as exc:
+                logger.warning("Perspective warp CUDA cleanup skipped: %s", exc)
         logger.info("Perspective warp unloaded.")
 
     def is_loaded(self) -> bool:
@@ -173,7 +176,8 @@ def _apply_color_transfer(
         mu_bg = float(bg_flat[:, c].mean())
         std_bg = float(bg_flat[:, c].std()) + 1e-6
 
-        transferred = (fg_f[:, :, c] - mu_fg) * (std_bg / std_fg) + mu_bg
+        ratio = float(np.clip(std_bg / std_fg, 0.5, 2.0))
+        transferred = (fg_f[:, :, c] - mu_fg) * ratio + mu_bg
         # Blend: partial transfer controlled by strength
         result_f[:, :, c] = fg_f[:, :, c] * (1.0 - strength) + transferred * strength
 

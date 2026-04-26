@@ -89,11 +89,18 @@ class DepthEstimationWrapper:
                 )
 
             _disable_drop_path_if_present(model)
-            model.to(device)
+            try:
+                model.to(device)
+                self._runtime_device = device
+            except RuntimeError as exc:
+                if not _is_cuda_oom(exc) or device != "cuda":
+                    raise
+                logger.warning("ZoeDepth CUDA load failed (%s) — retrying on CPU.", exc)
+                model.to("cpu")
+                self._runtime_device = "cpu"
             model.eval()
             self._model = model
             self._use_real = True
-            self._runtime_device = device
             logger.info("ZoeDepth (%s) loaded (real weights).", model_name)
         except Exception as exc:
             logger.warning(
@@ -107,7 +114,10 @@ class DepthEstimationWrapper:
         self._use_real = False
         self._runtime_device = self._config.device.device
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError as exc:
+                logger.warning("ZoeDepth CUDA cleanup skipped: %s", exc)
         logger.info("ZoeDepth unloaded.")
 
     def is_loaded(self) -> bool:
@@ -134,7 +144,7 @@ class DepthEstimationWrapper:
             try:
                 depth = self._infer_real(pil_img)
             except RuntimeError as exc:
-                if not _is_nvrtc_error(exc) or self._runtime_device == "cpu":
+                if not (_is_nvrtc_error(exc) or _is_cuda_oom(exc)) or self._runtime_device == "cpu":
                     raise
                 logger.warning(
                     "ZoeDepth CUDA inference failed (%s) - retrying on CPU.",
@@ -233,6 +243,11 @@ class _DummyZoeDepth:
 def _is_nvrtc_error(exc: RuntimeError) -> bool:
     msg = str(exc)
     return "nvrtc" in msg.lower() or "nvrtc-builtins64_121.dll" in msg.lower()
+
+
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg and "cuda" in msg
 
 
 def _load_zoedepth_state_dict(checkpoint: Path) -> dict[str, Any]:

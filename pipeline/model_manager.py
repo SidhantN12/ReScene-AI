@@ -29,6 +29,17 @@ from config import Config, MODEL_VRAM_GB
 logger = logging.getLogger(__name__)
 
 
+def _safe_cuda_cleanup() -> None:
+    if not torch.cuda.is_available():
+        return
+    for fn in (torch.cuda.empty_cache, torch.cuda.synchronize):
+        try:
+            fn()
+        except RuntimeError as exc:
+            logger.warning("CUDA cleanup skipped after device error: %s", exc)
+            break
+
+
 class ModelManager:
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -93,11 +104,12 @@ class ModelManager:
         if wrapper is None or not wrapper.is_loaded():
             return
         logger.info("Unloading model: %s", name)
-        wrapper.unload()
+        try:
+            wrapper.unload()
+        except RuntimeError as exc:
+            logger.warning("Model '%s' unload raised after runtime failure: %s", name, exc)
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+        _safe_cuda_cleanup()
         logger.debug("VRAM after unload: %.2f GB used", self._vram_used_gb())
         if self._current == name:
             self._current = None
@@ -128,8 +140,7 @@ class ModelManager:
                 name, needed, free,
             )
             gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _safe_cuda_cleanup()
             free = self._vram_free_gb()
             if needed > free:
                 raise RuntimeError(

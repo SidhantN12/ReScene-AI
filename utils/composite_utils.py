@@ -177,6 +177,7 @@ def simple_color_match(
     fg: np.ndarray,
     bg: np.ndarray,
     mask: np.ndarray,
+    strength: float = 1.0,
 ) -> np.ndarray:
     """Match *fg* colour distribution to the *bg* region sampled under *mask*.
 
@@ -185,9 +186,10 @@ def simple_color_match(
 
     Parameters
     ----------
-    fg   : H_f×W_f×3 uint8 RGB — foreground patch to colour-correct
-    bg   : H×W×3 uint8 RGB — background scene used as colour reference
-    mask : H×W uint8 — 255 where to sample background statistics
+    fg       : H_f×W_f×3 uint8 RGB — foreground patch to colour-correct
+    bg       : H×W×3 uint8 RGB — background scene used as colour reference
+    mask     : H×W uint8 — 255 where to sample background statistics
+    strength : 0–1 blend between original fg (0) and fully transferred (1)
 
     Returns
     -------
@@ -206,6 +208,9 @@ def simple_color_match(
         std_fg = fg_f[:, :, c].std() + 1e-6
         mu_bg = float(bg_pixels[:, c].mean())
         std_bg = float(bg_pixels[:, c].std()) + 1e-6
-        result[:, :, c] = (fg_f[:, :, c] - mu_fg) * (std_bg / std_fg) + mu_bg
+        # Clamp ratio so a nearly uniform background doesn't flatten all contrast
+        ratio = float(np.clip(std_bg / std_fg, 0.5, 2.0))
+        transferred = (fg_f[:, :, c] - mu_fg) * ratio + mu_bg
+        result[:, :, c] = fg_f[:, :, c] * (1.0 - strength) + transferred * strength
 
     return result.clip(0, 255).astype(np.uint8)

@@ -55,6 +55,16 @@ for _d in (MODELS_DIR, OUTPUTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
+def _preferred_sam_checkpoint() -> tuple[Path, str]:
+    vit_b = MODELS_DIR / "sam_vit_b_01ec64.pth"
+    vit_h = MODELS_DIR / "sam_vit_h_4b8939.pth"
+    if vit_b.exists():
+        return vit_b, "vit_b"
+    if vit_h.exists():
+        return vit_h, "vit_h"
+    return vit_b, "vit_b"
+
+
 # ---------------------------------------------------------------------------
 # Device
 # ---------------------------------------------------------------------------
@@ -79,18 +89,20 @@ class DeviceConfig:
 
 @dataclass
 class ModelPaths:
-    # SAM ViT-H
-    sam_checkpoint: Path = field(default_factory=lambda: MODELS_DIR / "sam_vit_h_4b8939.pth")
-    sam_model_type: str = "vit_h"
+    # SAM defaults to ViT-B for lower VRAM pressure; fallback to ViT-H if that is
+    # the only checkpoint currently present.
+    sam_checkpoint: Path = field(default_factory=lambda: _preferred_sam_checkpoint()[0])
+    sam_model_type: str = field(default_factory=lambda: _preferred_sam_checkpoint()[1])
 
     # ZoeDepth — NK = joint NYUv2+KITTI, best for indoor scenes
     zoedepth_checkpoint: Path = field(default_factory=lambda: MODELS_DIR / "ZoeD_M12_NK.pt")
     zoedepth_model_name: str = "ZoeD_NK"
 
     # LaMa inpainting (preferred over MAT for speed).
-    # Current runtime uses simple-lama-inpainting's own cache; this path is kept
-    # only as a conventional local location if you later choose to mirror weights.
+    # Prefer a repo-local TorchScript checkpoint when present; otherwise the
+    # wrapper can use the simple-lama cache under torch hub checkpoints.
     lama_dir: Path = field(default_factory=lambda: MODELS_DIR / "lama")
+    lama_checkpoint: Path = field(default_factory=lambda: MODELS_DIR / "lama" / "big-lama.pt")
 
     # MAT inpainting (fallback / high-quality mode)
     mat_checkpoint: Path = field(default_factory=lambda: MODELS_DIR / "mat" / "places_512_G.pkl")
@@ -121,7 +133,7 @@ class ModelPaths:
 # ---------------------------------------------------------------------------
 
 MODEL_VRAM_GB: dict[str, float] = {
-    "sam": 3.5,          # ViT-H image encoder in fp16; decoder+prompt encoder fp32
+    "sam": 1.8,          # ViT-B preferred; much safer than ViT-H for live interaction
     "zoedepth": 1.2,     # ZoeD_NK; inference with autocast fp16 → ~0.7 GB
     "clip": 0.6,         # ViT-B/32; loaded on CPU or GPU, fp32
     "lama": 1.0,
@@ -202,6 +214,8 @@ class SceneConfig:
     scene_cache_max: int = 4
     # Whether to build SceneContext on upload (set False to disable for speed)
     build_on_upload: bool = True
+    # Long-edge cap used only for scene understanding / planning analysis.
+    analysis_max_image_size: int = 640
 
 
 # ---------------------------------------------------------------------------

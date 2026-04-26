@@ -20,6 +20,8 @@ Pipeline for every request
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Any, Literal
 
 import cv2
@@ -45,6 +47,8 @@ class InpaintingWrapper:
         self._backend: Backend = backend
         self._model: Any = None
         self._use_real: bool = False
+        self._runtime_device: str = config.device.device
+        self._model_path: str | None = None
 
     # ------------------------------------------------------------------
     # ModelWrapper interface
@@ -63,11 +67,24 @@ class InpaintingWrapper:
         if self._backend == "lama":
             try:
                 from simple_lama_inpainting import SimpleLama   # type: ignore
-                logger.info("Downloading / loading LaMa weights (first run: ~200 MB)…")
-                # SimpleLama() downloads big-lama from HuggingFace on first call
-                self._model = SimpleLama()
+                resolved_model = _resolve_big_lama_checkpoint(self._config)
+                if resolved_model is not None:
+                    os.environ["LAMA_MODEL"] = str(resolved_model)
+                    self._model_path = str(resolved_model)
+                    logger.info("Loading big-lama from %s", resolved_model)
+                else:
+                    logger.info("Downloading / loading big-lama weights (first run: ~200 MB)…")
+                try:
+                    self._model = SimpleLama(device=torch.device(device))
+                    self._runtime_device = device
+                except RuntimeError as exc:
+                    if not _is_cuda_oom(exc) or device != "cuda":
+                        raise
+                    logger.warning("big-lama CUDA load failed (%s) — retrying on CPU.", exc)
+                    self._model = SimpleLama(device=torch.device("cpu"))
+                    self._runtime_device = "cpu"
                 self._use_real = True
-                logger.info("LaMa loaded (real weights).")
+                logger.info("big-lama loaded (real weights) on %s.", self._runtime_device)
                 return
             except ImportError:
                 logger.warning(
@@ -81,13 +98,18 @@ class InpaintingWrapper:
         self._model = _OpenCVInpainter()
         self._backend = "opencv"
         self._use_real = False
+        self._runtime_device = self._config.device.device
         logger.info("OpenCV inpainting active (INPAINT_TELEA).")
 
     def unload(self) -> None:
         self._model = None
         self._use_real = False
+        self._runtime_device = self._config.device.device
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError as exc:
+                logger.warning("Inpainting CUDA cleanup skipped: %s", exc)
         logger.info("Inpainting model unloaded.")
 
     def is_loaded(self) -> bool:
@@ -167,7 +189,14 @@ class InpaintingWrapper:
         from PIL import Image as PILImage
         pil_img = PILImage.fromarray(image)
         pil_msk = PILImage.fromarray(mask).convert("L")
-        pil_result = self._model(pil_img, pil_msk)
+        try:
+            pil_result = self._model(pil_img, pil_msk)
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc) or self._runtime_device != "cuda":
+                raise
+            logger.warning("big-lama CUDA inference failed (%s) — retrying on CPU.", exc)
+            self._reload_lama_on_cpu()
+            pil_result = self._model(pil_img, pil_msk)
         result = np.array(pil_result)
         if result.ndim == 2:
             result = np.stack([result] * 3, axis=-1)
@@ -184,6 +213,19 @@ class InpaintingWrapper:
         radius = min(radius, 21)
         result_bgr = cv2.inpaint(bgr, mask_u8, radius, cv2.INPAINT_TELEA)
         return cv2.cvtColor(result_bgr, cv2.COLOR_BGR2RGB)
+
+    def _reload_lama_on_cpu(self) -> None:
+        from simple_lama_inpainting import SimpleLama  # type: ignore
+
+        if self._model_path:
+            os.environ["LAMA_MODEL"] = self._model_path
+        self._model = SimpleLama(device=torch.device("cpu"))
+        self._runtime_device = "cpu"
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -243,3 +285,29 @@ def _blend_boundary(
 class _OpenCVInpainter:
     """Sentinel object — actual inference done in InpaintingWrapper._run_opencv."""
     pass
+
+
+def _resolve_big_lama_checkpoint(config: Config) -> Path | None:
+    candidates = [
+        config.models.lama_checkpoint,
+        _torch_hub_big_lama_path(),
+    ]
+    env_path = os.environ.get("LAMA_MODEL")
+    if env_path:
+        candidates.insert(0, Path(env_path))
+
+    for candidate in candidates:
+        if candidate is not None and Path(candidate).exists():
+            return Path(candidate)
+    return None
+
+
+def _torch_hub_big_lama_path() -> Path | None:
+    hub_dir = Path(torch.hub.get_dir())
+    candidate = hub_dir / "checkpoints" / "big-lama.pt"
+    return candidate if candidate.exists() else None
+
+
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg and "cuda" in msg

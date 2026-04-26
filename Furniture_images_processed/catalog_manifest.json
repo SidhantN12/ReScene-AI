@@ -1,0 +1,111 @@
+{
+  "items": [
+    {
+      "filename": "bookshelf_img.png",
+      "label": "Bookshelf",
+      "aliases": [
+        "bookcase",
+        "bookshelf",
+        "shelf"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "chair_img.png",
+      "label": "Chair",
+      "aliases": [
+        "accent chair",
+        "chair"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "cupboard_p.png",
+      "label": "Cupboard",
+      "aliases": [
+        "cabinet",
+        "cupboard",
+        "storage cabinet"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "figurine.png",
+      "label": "Figurine",
+      "aliases": [
+        "figurine"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "painting.png",
+      "label": "Painting",
+      "aliases": [
+        "painting"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "sofa_p.png",
+      "label": "Sofa",
+      "aliases": [
+        "couch",
+        "loveseat",
+        "sofa"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "table_p.png",
+      "label": "Table",
+      "aliases": [
+        "coffee table",
+        "side table",
+        "table"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "tvstand_p.png",
+      "label": "TV Stand",
+      "aliases": [
+        "console",
+        "media console",
+        "tv stand",
+        "tvstand"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "wallshelf.png",
+      "label": "Wall Shelf",
+      "aliases": [
+        "floating shelf",
+        "shelf",
+        "wall shelf",
+        "wallshelf"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "wallshelf_p.png",
+      "label": "Wall Shelf 2",
+      "aliases": [
+        "floating shelf",
+        "shelf",
+        "wall shelf",
+        "wallshelf"
+      ],
+      "source": "Furniture_images_processed"
+    },
+    {
+      "filename": "wallshelf 3.png",
+      "label": "Wallshelf 3",
+      "aliases": [
+        "wallshelf 3",
+        "wallshelf3"
+      ],
+      "source": "Furniture_images_processed"
+    }
+  ]
+}

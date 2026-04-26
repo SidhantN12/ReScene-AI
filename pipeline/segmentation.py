@@ -47,6 +47,7 @@ class SegmentationWrapper:
         self._model: Any = None
         self._predictor: Any = None
         self._use_real: bool = False
+        self._runtime_device: str = config.device.device
 
     # ------------------------------------------------------------------
     # ModelWrapper interface
@@ -84,11 +85,18 @@ class SegmentationWrapper:
         sam = sam_model_registry[self._config.models.sam_model_type](
             checkpoint=str(checkpoint)
         )
-        sam.to(device=device)
-
-        # Apply fp16 only to the image encoder (3× larger than decoder)
-        if device == "cuda":
-            sam.image_encoder = sam.image_encoder.half()
+        try:
+            sam.to(device=device)
+            if device == "cuda":
+                sam.image_encoder = sam.image_encoder.half()
+            self._runtime_device = device
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc) or device != "cuda":
+                raise
+            logger.warning("SAM CUDA load failed (%s) — retrying on CPU.", exc)
+            sam = sam.float()
+            sam.to(device="cpu")
+            self._runtime_device = "cpu"
 
         self._model = sam
         self._predictor = SamPredictor(sam)
@@ -100,8 +108,12 @@ class SegmentationWrapper:
         self._model = None
         self._predictor = None
         self._use_real = False
+        self._runtime_device = self._config.device.device
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError as exc:
+                logger.warning("SAM CUDA cleanup skipped: %s", exc)
         logger.info("SAM unloaded.")
 
     def is_loaded(self) -> bool:
@@ -189,14 +201,30 @@ class SegmentationWrapper:
             min_mask_region_area=min_area_px,
         )
 
-        device = self._config.device.device
+        device = self._runtime_device
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.float16)
             if device == "cuda"
             else torch.no_grad()
         )
-        with torch.no_grad(), autocast_ctx:
-            annotations = generator.generate(image)
+        try:
+            with torch.no_grad(), autocast_ctx:
+                annotations = generator.generate(image)
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc) or self._runtime_device != "cuda":
+                raise
+            logger.warning("SAM automatic CUDA inference failed (%s) — retrying on CPU.", exc)
+            self._move_to_cpu()
+            generator = SamAutomaticMaskGenerator(
+                model=self._model,
+                points_per_side=self._config.inference.sam_points_per_side,
+                pred_iou_thresh=self._config.inference.sam_pred_iou_thresh,
+                stability_score_thresh=self._config.inference.sam_stability_score_thresh,
+                box_nms_thresh=self._config.inference.sam_box_nms_thresh,
+                min_mask_region_area=min_area_px,
+            )
+            with torch.no_grad():
+                annotations = generator.generate(image)
 
         # Sort by area descending (largest objects first)
         annotations.sort(key=lambda a: a["area"], reverse=True)
@@ -226,24 +254,37 @@ class SegmentationWrapper:
         point_labels: list[int] | None,
         box: tuple[int, int, int, int] | None,
     ) -> dict[str, Any]:
-        device = self._config.device.device
+        device = self._runtime_device
         autocast_ctx = (
             torch.autocast(device_type="cuda", dtype=torch.float16)
             if device == "cuda"
             else torch.no_grad()
         )
-        with torch.no_grad(), autocast_ctx:
-            self._predictor.set_image(image)
-            point_coords = np.array(points, dtype=np.float32) if points else None
-            point_lbls = np.array(point_labels, dtype=np.int32) if point_labels else None
-            box_arr = np.array(box, dtype=np.float32) if box else None
-
-            raw_masks, raw_scores, _ = self._predictor.predict(
-                point_coords=point_coords,
-                point_labels=point_lbls,
-                box=box_arr,
-                multimask_output=True,
-            )
+        point_coords = np.array(points, dtype=np.float32) if points else None
+        point_lbls = np.array(point_labels, dtype=np.int32) if point_labels else None
+        box_arr = np.array(box, dtype=np.float32) if box else None
+        try:
+            with torch.no_grad(), autocast_ctx:
+                self._predictor.set_image(image)
+                raw_masks, raw_scores, _ = self._predictor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_lbls,
+                    box=box_arr,
+                    multimask_output=True,
+                )
+        except RuntimeError as exc:
+            if not _is_cuda_oom(exc) or self._runtime_device != "cuda":
+                raise
+            logger.warning("SAM prompted CUDA inference failed (%s) — retrying on CPU.", exc)
+            self._move_to_cpu()
+            with torch.no_grad():
+                self._predictor.set_image(image)
+                raw_masks, raw_scores, _ = self._predictor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_lbls,
+                    box=box_arr,
+                    multimask_output=True,
+                )
 
         masks, scores, boxes, labels = [], [], [], []
         for i, (m, s) in enumerate(zip(raw_masks, raw_scores)):
@@ -260,6 +301,20 @@ class SegmentationWrapper:
         label_map = dict(zip(labels, masks))
         return {"masks": masks, "scores": scores, "boxes": boxes,
                 "labels": labels, "label_map": label_map}
+
+    def _move_to_cpu(self) -> None:
+        if self._model is None or self._runtime_device == "cpu":
+            return
+        self._model = self._model.float()
+        self._model.to("cpu")
+        from segment_anything import SamPredictor
+        self._predictor = SamPredictor(self._model)
+        self._runtime_device = "cpu"
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except RuntimeError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +342,11 @@ def _suppress_overlapping(
         if not dominated:
             kept.append(ann)
     return kept
+
+
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg and "cuda" in msg
 
 
 def draw_segmentation_overlay(
