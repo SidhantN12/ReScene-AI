@@ -15,6 +15,9 @@ import re
 from pathlib import Path
 from typing import Any
 
+from pipeline.object_size_priors import canonical_object_class, object_size_for
+from pipeline.placement_planner import PlacementRequest
+
 # ---------------------------------------------------------------------------
 # Position vocabulary  (text hint → (x_frac, y_frac) in [0, 1]²)
 # ---------------------------------------------------------------------------
@@ -327,15 +330,20 @@ def _parse_add_clause(
         item_name, pos_hint = _split_item_and_position(item_raw)
         catalog_match = _match_catalog(item_name, catalog_lookup)
         if catalog_match:
-            px, py, resolved_hint = _resolve_pos(pos_hint, clause, img_w, img_h)
+            resolved_hint = _resolve_location_hint(pos_hint, clause, img_w, img_h)
+            object_class = canonical_object_class(item_name)
             instructions.append({
                 "operation": "add",
                 "furniture_image_path": catalog_match,
-                "target_position": [px, py],
+                "placement_request": PlacementRequest(
+                    object_class=object_class,
+                    object_size_estimate=object_size_for(object_class),
+                    location_hint=resolved_hint,
+                ),
                 "catalog_label": _catalog_display_label(catalog_match),
-                "position_hint": resolved_hint,
+                "position_hint": _location_hint_label(resolved_hint),
             })
-            if resolved_hint == "default":
+            if _location_hint_label(resolved_hint) == "default":
                 warnings.append(
                     f"Add '{item_name}' — no clear location phrase found; defaulting to lower-center."
                 )
@@ -380,6 +388,14 @@ def _split_item_and_position(item_raw: str) -> tuple[str, str]:
          "armchair"         → ("armchair", "")
     """
     text = item_raw.lower()
+    relational_match = re.search(
+        r"\b(next to|in front of|facing|against(?: the)? wall)\b", text
+    )
+    if relational_match:
+        item = text[: relational_match.start()]
+        item = re.sub(r"\b(on|in|to|at|the|a|an)\b", "", item).strip()
+        item = re.sub(r"\s{2,}", " ", item).strip(" -.,")
+        return (item or item_raw), ""
     # Try two-word hints first (longer match wins)
     for hint in sorted(_POSITION_HINTS, key=len, reverse=True):
         if hint in text:
@@ -390,23 +406,46 @@ def _split_item_and_position(item_raw: str) -> tuple[str, str]:
     return item_raw, ""
 
 
-def _resolve_pos(
+def _resolve_location_hint(
     hint: str,
     clause: str,
     img_w: int,
     img_h: int,
-) -> tuple[int, int, str]:
-    """Convert a positional hint (or whole clause scan) to pixel coords."""
-    if hint in _POSITION_HINTS:
-        xf, yf = _POSITION_HINTS[hint]
-        return int(xf * img_w), int(yf * img_h), hint
-    # Scan full clause for any positional keyword
+) -> str | tuple[float, float]:
+    """Resolve a raw text clause to a planner location hint."""
+    full = clause.lower()
+    if "against wall" in full or "against the wall" in full:
+        return "against_wall"
+    next_to = re.search(r"next to\s+(?:the\s+)?([\w][\w\s\-]*)", full)
+    if next_to:
+        return f"next_to:{canonical_object_class(next_to.group(1).strip())}"
+    in_front = re.search(r"in front of\s+(?:the\s+)?([\w][\w\s\-]*)", full)
+    if in_front:
+        return f"in_front_of:{canonical_object_class(in_front.group(1).strip())}"
+    facing = re.search(r"facing\s+(?:the\s+)?([\w][\w\s\-]*)", full)
+    if facing:
+        return f"facing:{canonical_object_class(facing.group(1).strip())}"
+    if hint in {"corner", "left", "right", "center", "centre"}:
+        return "center" if hint == "centre" else hint
     for kw in sorted(_POSITION_HINTS, key=len, reverse=True):
-        if kw in clause:
+        if kw in full:
+            if kw == "corner":
+                return "corner"
+            if kw in {"left", "right"}:
+                return kw
+            if kw in {"center", "centre", "middle"}:
+                return "center"
             xf, yf = _POSITION_HINTS[kw]
-            return int(xf * img_w), int(yf * img_h), kw
-    # Default: lower-centre (typical furniture placement)
-    return img_w // 2, int(img_h * 0.65), "default"
+            return (xf, yf)
+    return (0.50, 0.65)
+
+
+def _location_hint_label(hint: str | tuple[float, float]) -> str:
+    if isinstance(hint, tuple):
+        if abs(hint[0] - 0.50) < 1e-6 and abs(hint[1] - 0.65) < 1e-6:
+            return "default"
+        return f"raw({hint[0]:.2f},{hint[1]:.2f})"
+    return hint
 
 
 def _catalog_display_label(filename: str) -> str:

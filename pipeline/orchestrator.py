@@ -28,6 +28,13 @@ import numpy as np
 
 from config import Config, config as default_config
 from pipeline.model_manager import ModelManager
+from pipeline.object_size_priors import canonical_object_class, object_size_for
+from pipeline.placement_planner import (
+    OccupancyTracker,
+    PlacementPlanner,
+    PlacementRequest,
+    PlacementResult,
+)
 from pipeline.scene_context import SceneContext
 from pipeline.segmentation import SegmentationWrapper
 from pipeline.depth_estimation import DepthEstimationWrapper
@@ -48,9 +55,11 @@ Position = tuple[int, int]   # (x, y) in pixels of the final output image
 class PipelineOrchestrator:
     """Coordinates all ReScene AI operations through sequential model execution."""
 
-    def __init__(self, config: Config = default_config) -> None:
+    def __init__(self, config: Config = default_config, use_v2_planner: bool = False) -> None:
         self._cfg = config
+        self._use_v2_planner = use_v2_planner
         self._mm = ModelManager(config)
+        self._placement_planner = PlacementPlanner() if use_v2_planner else None
         self._register_wrappers()
 
     # ------------------------------------------------------------------
@@ -309,6 +318,9 @@ class PipelineOrchestrator:
         target_position: Position,
         size_multiplier: float = 1.0,
         scene_context: SceneContext | None = None,
+        object_class: str | None = None,
+        placement_request: PlacementRequest | None = None,
+        occupancy_tracker: OccupancyTracker | None = None,
     ) -> np.ndarray:
         """Insert a furniture item into the scene at *target_position*.
 
@@ -339,9 +351,38 @@ class PipelineOrchestrator:
             furniture_rgba = furniture_image.copy()
         furniture_rgba = _crop_rgba_to_alpha(furniture_rgba)
 
-        # Step 1: Depth estimation for scale (reuse cached depth if available)
+        plan_result: PlacementResult | None = None
+        plan_request = placement_request
+        tracker = occupancy_tracker
         tx, ty = int(np.clip(target_position[0], 0, w - 1)), int(np.clip(target_position[1], 0, h - 1))
-        if scene_context is not None and scene_context.depth_map is not None:
+
+        if self._use_v2_planner and scene_context is not None and self._placement_planner is not None:
+            scaled_scene = _resize_scene_context(scene_context, (h, w))
+            tracker = tracker or OccupancyTracker(scaled_scene)
+            if plan_request is None:
+                canonical_class = canonical_object_class(object_class)
+                size_prior = object_size_for(canonical_class)
+                scaled_size = tuple(float(v) * max(0.25, float(size_multiplier)) for v in size_prior)
+                plan_request = PlacementRequest(
+                    object_class=canonical_class,
+                    object_size_estimate=scaled_size,
+                    location_hint=(tx / max(w, 1), ty / max(h, 1)),
+                )
+            else:
+                plan_request = PlacementRequest(
+                    object_class=canonical_object_class(plan_request.object_class),
+                    object_size_estimate=tuple(float(v) for v in plan_request.object_size_estimate),
+                    location_hint=plan_request.location_hint,
+                    clearance_required=plan_request.clearance_required,
+                )
+            plan_result = self._placement_planner.plan(tracker.scene, plan_request)
+            tx, ty = plan_result.position_px
+
+        # Step 1: Depth estimation for scale (reuse cached depth if available)
+        if plan_result is not None:
+            depth_map = tracker.scene.depth_map if tracker is not None else None
+            scale_factor = float(plan_result.scale_factor)
+        elif scene_context is not None and scene_context.depth_map is not None:
             depth_map = cv2.resize(
                 scene_context.depth_map, (w, h), interpolation=cv2.INTER_LINEAR
             )
@@ -357,7 +398,11 @@ class PipelineOrchestrator:
 
         # Step 2: Perspective warp furniture
         fw, fh = furniture_rgba.shape[1], furniture_rgba.shape[0]
-        target_size = (max(int(fw * scale_factor), 4), max(int(fh * scale_factor), 4))
+        if plan_result is not None and plan_request is not None:
+            desired_height_px = max(8, int(round(plan_request.object_size_estimate[2] * plan_result.scale_factor)))
+            target_size = (max(int(round(desired_height_px * fw / max(fh, 1))), 4), desired_height_px)
+        else:
+            target_size = (max(int(fw * scale_factor), 4), max(int(fh * scale_factor), 4))
         h_p = min(h, max(8, int(h * 0.3)))
         w_p = min(w, max(8, int(w * 0.3)))
         scene_patch = image[
@@ -374,7 +419,10 @@ class PipelineOrchestrator:
         self._mm.unload_current()
 
         # Step 3: Composite
-        result, obj_mask = paste_with_mask(image, warped_rgba, (tx, ty))
+        paste_position = (tx, ty)
+        if plan_result is not None:
+            paste_position = (tx, max(0, ty - warped_rgba.shape[0] // 2))
+        result, obj_mask = paste_with_mask(image, warped_rgba, paste_position)
 
         # Step 3.5: Colour-match the inserted object to its surroundings
         result = _color_match_composite(result, image, obj_mask)
@@ -388,6 +436,9 @@ class PipelineOrchestrator:
         harmonizer = self._mm.get("iharmony4")
         result = harmonizer.predict(composite=result, foreground_mask=obj_mask)
         self._mm.unload_current()
+
+        if tracker is not None and plan_result is not None:
+            tracker.reserve(plan_result.footprint_mask)
 
         logger.info("[ADD] Done.")
         return result
@@ -435,6 +486,31 @@ class PipelineOrchestrator:
 
         logger.info("[RESTYLE] Done.")
         return result
+
+    def plan_add_placement(
+        self,
+        scene_context: SceneContext,
+        object_class: str,
+        location_hint: str | tuple[float, float],
+        *,
+        size_multiplier: float = 1.0,
+        clearance_required: float = 0.3,
+        occupancy_tracker: OccupancyTracker | None = None,
+    ) -> PlacementResult:
+        """Return a planner result without executing the add composite path."""
+        if not self._use_v2_planner or self._placement_planner is None:
+            raise RuntimeError("V2 placement planner is disabled on this orchestrator.")
+        canonical_class = canonical_object_class(object_class)
+        size_prior = object_size_for(canonical_class)
+        scaled_size = tuple(float(v) * max(0.25, float(size_multiplier)) for v in size_prior)
+        request = PlacementRequest(
+            object_class=canonical_class,
+            object_size_estimate=scaled_size,
+            location_hint=location_hint,
+            clearance_required=clearance_required,
+        )
+        tracker = occupancy_tracker or OccupancyTracker(scene_context)
+        return self._placement_planner.plan(tracker.scene, request)
 
     def understand_scene(self, image: np.ndarray) -> dict[str, Any]:
         """Run SAM + ZoeDepth to produce a complete scene understanding.
@@ -508,20 +584,31 @@ class PipelineOrchestrator:
         import torch as _torch
         logger.info("[COMPOUND] Running %d operations.", len(instructions))
         result = image.copy()
-        dispatch = {
-            "remove":  lambda img, kw: self.remove(img, **kw),
-            "move":    lambda img, kw: self.move(img, **kw),
-            "add":     lambda img, kw: self.add(img, **kw),
-            "restyle": lambda img, kw: self.restyle(img, **kw),
-        }
+        occupancy_tracker: OccupancyTracker | None = None
+        occupancy_hash: str | None = None
         for i, instr in enumerate(instructions):
             op = instr.get("operation")
             kw = {k: v for k, v in instr.items() if k != "operation"}
             logger.info("[COMPOUND] Step %d/%d: %s", i + 1, len(instructions), op)
-            if op not in dispatch:
-                raise ValueError(f"Unknown operation: '{op}'")
             t0 = time.perf_counter()
-            result = dispatch[op](result, kw)
+            if op == "remove":
+                result = self.remove(result, **kw)
+            elif op == "move":
+                result = self.move(result, **kw)
+            elif op == "add":
+                scene_ctx = kw.get("scene_context")
+                if self._use_v2_planner and scene_ctx is not None:
+                    scaled_scene = _resize_scene_context(scene_ctx, _prep(result, self._cfg).shape[:2])
+                    if occupancy_tracker is None or occupancy_hash != scaled_scene.image_hash:
+                        occupancy_tracker = OccupancyTracker(scaled_scene)
+                        occupancy_hash = scaled_scene.image_hash
+                    kw["scene_context"] = occupancy_tracker.scene
+                    kw["occupancy_tracker"] = occupancy_tracker
+                result = self.add(result, **kw)
+            elif op == "restyle":
+                result = self.restyle(result, **kw)
+            else:
+                raise ValueError(f"Unknown operation: '{op}'")
             elapsed = time.perf_counter() - t0
             vram_mb = (
                 _torch.cuda.memory_allocated() / 1024 ** 2
@@ -588,6 +675,63 @@ def _crop_rgba_to_alpha(rgba: np.ndarray, pad: int = 4) -> np.ndarray:
     x1 = min(rgba.shape[1], int(xs.max()) + 1 + pad)
     y1 = min(rgba.shape[0], int(ys.max()) + 1 + pad)
     return rgba[y0:y1, x0:x1]
+
+
+def _resize_scene_context(scene: SceneContext, target_shape: tuple[int, int]) -> SceneContext:
+    """Resize a SceneContext to match a processed pipeline image shape."""
+    th, tw = target_shape
+    sh, sw = scene.image.shape[:2]
+    if (sh, sw) == (th, tw):
+        return scene
+
+    def _resize_bool(mask: np.ndarray | None) -> np.ndarray | None:
+        if mask is None:
+            return None
+        resized = cv2.resize(mask.astype(np.uint8), (tw, th), interpolation=cv2.INTER_NEAREST)
+        return resized.astype(bool)
+
+    resized_masks = {
+        mid: _resize_bool(mask)
+        for mid, mask in scene.panoptic_masks.items()
+    }
+    resized_image = cv2.resize(scene.image, (tw, th), interpolation=cv2.INTER_AREA)
+    depth_map = None
+    if scene.depth_map is not None:
+        depth_map = cv2.resize(scene.depth_map.astype(np.float32), (tw, th), interpolation=cv2.INTER_LINEAR)
+
+    sx = tw / max(sw, 1)
+    sy = th / max(sh, 1)
+    intr = dict(scene.camera_intrinsics_estimate)
+    if intr:
+        intr["fx"] = float(intr.get("fx", tw * 1.15)) * sx
+        intr["fy"] = float(intr.get("fy", th * 1.15)) * sy
+        intr["cx"] = float(intr.get("cx", sw / 2.0)) * sx
+        intr["cy"] = float(intr.get("cy", sh / 2.0)) * sy
+        intr["f_px"] = float(intr.get("f_px", tw * 1.15)) * ((sx + sy) * 0.5)
+
+    return SceneContext(
+        image=resized_image,
+        image_hash=scene.image_hash,
+        depth_map=depth_map,
+        panoptic_masks={mid: mask for mid, mask in resized_masks.items() if mask is not None},
+        panoptic_labels=dict(scene.panoptic_labels),
+        floor_mask=_resize_bool(scene.floor_mask),
+        wall_masks=[wm for wm in (_resize_bool(mask) for mask in scene.wall_masks) if wm is not None],
+        ceiling_mask=_resize_bool(scene.ceiling_mask),
+        occupancy_mask=_resize_bool(scene.occupancy_mask),
+        free_floor_mask=_resize_bool(scene.free_floor_mask),
+        vanishing_points=[(vx * sx, vy * sy) for vx, vy in scene.vanishing_points],
+        camera_intrinsics_estimate=intr,
+        anchor_candidates=[
+            {
+                **anchor,
+                "x": int(round(anchor["x"] * sx)),
+                "y": int(round(anchor["y"] * sy)),
+            }
+            for anchor in scene.anchor_candidates
+        ],
+        metadata=dict(scene.metadata),
+    )
 
 
 def _pick_mask_by_name(

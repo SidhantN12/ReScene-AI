@@ -34,8 +34,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import config, STYLES
 from catalog_utils import load_catalog_items, build_choice_map, build_nl_lookup
+from pipeline.object_size_priors import OBJECT_SIZE_PRIORS, canonical_object_class, object_size_for
 from pipeline.orchestrator import PipelineOrchestrator
 from pipeline.nl_parser import parse_nl
+from pipeline.placement_planner import PlacementRequest
 from pipeline.scene_context import SceneContext, SceneContextBuilder
 from pipeline.scene_cache import get_scene_cache
 from utils.image_utils import ensure_rgb
@@ -91,7 +93,7 @@ def _orch() -> PipelineOrchestrator:
     global _orchestrator
     if _orchestrator is None:
         logger.info("Initialising pipeline orchestrator…")
-        _orchestrator = PipelineOrchestrator(config)
+        _orchestrator = PipelineOrchestrator(config, use_v2_planner=True)
     return _orchestrator
 
 
@@ -138,6 +140,31 @@ def _catalog_choice_map() -> dict[str, str]:
 
 def _catalog_nl_lookup() -> dict[str, str]:
     return build_nl_lookup(load_catalog_items(CATALOG_DIR))
+
+
+def _planner_class_choices() -> list[str]:
+    return sorted(OBJECT_SIZE_PRIORS.keys())
+
+
+def _planner_class_from_label(label: str) -> str:
+    return canonical_object_class(label)
+
+
+def _build_add_request(
+    object_class: str,
+    size_multiplier: float,
+    target_position: tuple[int, int],
+    image_shape: tuple[int, int, int],
+) -> PlacementRequest:
+    h, w = image_shape[:2]
+    canonical_class = canonical_object_class(object_class)
+    size_prior = object_size_for(canonical_class)
+    scaled_size = tuple(float(v) * max(0.25, float(size_multiplier)) for v in size_prior)
+    return PlacementRequest(
+        object_class=canonical_class,
+        object_size_estimate=scaled_size,
+        location_hint=(target_position[0] / max(w, 1), target_position[1] / max(h, 1)),
+    )
 
 
 def _catalog_asset_to_rgba(src: np.ndarray) -> np.ndarray:
@@ -196,6 +223,31 @@ def _make_before_after(before: np.ndarray, after: np.ndarray) -> np.ndarray:
     a = _label(_fit(after), "After")
     div = np.full((target_h, 4, 3), 180, dtype=np.uint8)
     return np.concatenate([b, div, a], axis=1)
+
+
+def _render_planner_overlay(
+    image: np.ndarray,
+    footprint_mask: np.ndarray | None,
+    clearance_mask: np.ndarray | None,
+    anchor: tuple[int, int] | None = None,
+) -> np.ndarray:
+    canvas = ensure_rgb(image).copy()
+    bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+    if clearance_mask is not None and clearance_mask.any():
+        contours, _ = cv2.findContours(
+            clearance_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(bgr, contours, -1, (0, 220, 255), 2)
+    if footprint_mask is not None and footprint_mask.any():
+        contours, _ = cv2.findContours(
+            footprint_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cv2.drawContours(bgr, contours, -1, (30, 220, 80), 2)
+    if anchor is not None:
+        x, y = anchor
+        cv2.circle(bgr, (int(x), int(y)), 6, (255, 255, 255), -1)
+        cv2.circle(bgr, (int(x), int(y)), 12, (30, 220, 80), 2)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 def _make_slider_html(before: np.ndarray, after: np.ndarray, height: int = 380) -> str:
@@ -519,18 +571,20 @@ def on_add_room_upload(room_img: np.ndarray | None) -> tuple:
 
 def on_add_catalog_select(choice: str) -> tuple:
     if not choice or choice == "(upload instead)":
-        return None, None, "Upload your own furniture image below."
+        return None, None, "Upload your own furniture image below.", gr.update()
     choice_map = _catalog_choice_map()
     filename = choice_map.get(choice, choice)
     furn_path = CATALOG_DIR / filename
     if not furn_path.exists():
-        return None, None, f"Catalog file not found: {choice}"
+        return None, None, f"Catalog file not found: {choice}", gr.update()
     asset = cv2.imread(str(furn_path), cv2.IMREAD_UNCHANGED)
     if asset is None:
-        return None, None, f"Failed to load {choice}."
+        return None, None, f"Failed to load {choice}.", gr.update()
     rgba = _crop_rgba_to_alpha(_catalog_asset_to_rgba(asset))
     label = choice if choice in choice_map else furn_path.stem.replace("_", " ").title()
-    return rgba[:, :, :3].copy(), rgba, f"Catalog: {label} loaded."
+    return rgba[:, :, :3].copy(), rgba, f"Catalog: {label} loaded.", gr.update(
+        value=_planner_class_from_label(label)
+    )
 
 
 def on_add_furn_upload(furn: np.ndarray | None) -> tuple:
@@ -573,37 +627,60 @@ def on_add_execute(
     add_original: np.ndarray | None,
     add_furn: Any,
     add_target: tuple | None,
+    add_object_class: str,
     add_size_multiplier: float,
+    add_show_heatmap: bool,
     style_after: str = "None",
 ) -> tuple:
     if add_original is None:
-        return None, None, "Upload a room image first."
+        return None, None, "Upload a room image first.", None, "", None
     if add_furn is None:
-        return None, None, "Select or upload a furniture image."
+        return None, None, "Select or upload a furniture image.", None, "", None
     if add_target is None:
-        return None, None, "Click the room to set the insertion point."
+        return None, None, "Click the room to set the insertion point.", None, "", None
     tx, ty = add_target
     try:
         t0 = time.perf_counter()
         rgb_add = ensure_rgb(add_original)
         scene_ctx = _build_scene_ctx_safe(rgb_add)
+        placement_request = _build_add_request(
+            add_object_class, add_size_multiplier, (tx, ty), rgb_add.shape
+        )
+        plan_result = _orch().plan_add_placement(
+            scene_ctx,
+            add_object_class,
+            placement_request.location_hint,
+            size_multiplier=add_size_multiplier,
+        )
         result = _orch().add(image=rgb_add, furniture_image=add_furn,
                              target_position=(tx, ty),
                              size_multiplier=float(add_size_multiplier),
-                             scene_context=scene_ctx)
+                             scene_context=scene_ctx,
+                             object_class=add_object_class,
+                             placement_request=placement_request)
         if style_after and style_after != "None":
             result = _orch().restyle(image=result, style_name=style_after)
         elapsed = time.perf_counter() - t0
         comparison = _make_before_after(rgb_add, result)
+        plan_overlay = _render_planner_overlay(
+            rgb_add,
+            plan_result.footprint_mask,
+            plan_result.clearance_mask,
+            plan_result.position_px,
+        )
+        heatmap = None
+        if add_show_heatmap and plan_result.score_heatmap is not None:
+            heatmap = cv2.cvtColor(plan_result.score_heatmap, cv2.COLOR_BGR2RGB)
         status = _fmt_status(
-            f"Furniture added at ({tx}, {ty}) with size ×{add_size_multiplier:.2f}."
+            f"Furniture added at planned anchor ({plan_result.position_px[0]}, {plan_result.position_px[1]}) "
+            f"with size ×{add_size_multiplier:.2f}."
             + (f"  Mood shift: {style_after}." if style_after != "None" else ""),
             elapsed,
         )
-        return result, comparison, status
+        return result, comparison, status, plan_overlay, plan_result.reasoning, heatmap
     except Exception as exc:
         logger.exception("add failed")
-        return None, None, f"Error: {exc}"
+        return None, None, f"Error: {exc}", None, "", None
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +764,14 @@ def handle_nl_parse(
     for instr in instructions:
         item = dict(instr)
         filename = item.pop("furniture_image_path", None)
+        placement_request = item.get("placement_request")
+        if isinstance(placement_request, PlacementRequest):
+            item["placement_request"] = {
+                "object_class": placement_request.object_class,
+                "object_size_estimate": list(placement_request.object_size_estimate),
+                "location_hint": placement_request.location_hint,
+                "clearance_required": placement_request.clearance_required,
+            }
         if filename and "catalog_label" in item:
             item["catalog_label"] = reverse_choice_map.get(filename, item["catalog_label"])
         preview.append(item)
@@ -712,10 +797,9 @@ def handle_nl_compound(
     # Resolve furniture_image_path → numpy array
     preprocessed: list[dict] = []
     load_errs: list[str] = []
+    scene_ctx = _build_scene_ctx_safe(rgb)
     for instr in instructions:
         instr = dict(instr)
-        if "target_position" in instr:
-            instr["target_position"] = tuple(instr["target_position"])
         if "furniture_image_path" in instr:
             fpath = CATALOG_DIR / instr.pop("furniture_image_path")
             bgra = cv2.imread(str(fpath), cv2.IMREAD_UNCHANGED)
@@ -729,6 +813,7 @@ def handle_nl_compound(
             else:
                 furn = cv2.cvtColor(bgra, cv2.COLOR_GRAY2RGB)
             instr["furniture_image"] = furn
+            instr["scene_context"] = scene_ctx
         instr.pop("catalog_label", None)
         instr.pop("position_hint", None)
         preprocessed.append(instr)
@@ -959,6 +1044,11 @@ def build_ui() -> gr.Blocks:
                     add_furn = gr.Image(
                         label="— or upload a product photo (PNG preferred)",
                         type="numpy", height=180, sources=["upload"])
+                    add_object_class = gr.Dropdown(
+                        choices=_planner_class_choices(),
+                        value="side_table",
+                        label="Furniture Class (planner)",
+                    )
                     add_size = gr.Slider(
                         minimum=0.6,
                         maximum=2.6,
@@ -966,6 +1056,10 @@ def build_ui() -> gr.Blocks:
                         step=0.05,
                         label="Furniture Size Multiplier",
                         info="Increase this when the inserted furniture looks too small for the room.",
+                    )
+                    add_show_heatmap = gr.Checkbox(
+                        value=False,
+                        label="Debug: show planner scoring heatmap",
                     )
                     add_style_after = gr.Dropdown(
                         choices=["None"] + style_choices, value="None",
@@ -976,6 +1070,11 @@ def build_ui() -> gr.Blocks:
                                               height=400, interactive=False)
                     add_comparison = gr.Image(label="Before / After", type="numpy",
                                               height=400, interactive=False)
+                    add_plan_overlay = gr.Image(label="Planner footprint preview", type="numpy",
+                                                height=220, interactive=False)
+                    add_plan_reasoning = gr.Textbox(label="Planner reasoning", interactive=False, lines=7)
+                    add_heatmap = gr.Image(label="Planner heatmap", type="numpy",
+                                           height=220, interactive=False)
 
             add_room.upload(fn=on_add_room_upload, inputs=[add_room],
                             outputs=[add_room, add_original_state,
@@ -984,13 +1083,15 @@ def build_ui() -> gr.Blocks:
                             inputs=[add_original_state, add_scale_state],
                             outputs=[add_room, add_target_state, add_status])
             add_catalog.change(fn=on_add_catalog_select, inputs=[add_catalog],
-                               outputs=[add_furn, add_furn_state, add_status])
+                               outputs=[add_furn, add_furn_state, add_status, add_object_class])
             add_furn.upload(fn=on_add_furn_upload, inputs=[add_furn],
                             outputs=[add_furn_state, add_status])
             add_btn.click(fn=on_add_execute,
                           inputs=[add_original_state, add_furn_state,
-                                   add_target_state, add_size, add_style_after],
-                          outputs=[add_result, add_comparison, add_status])
+                                   add_target_state, add_object_class, add_size,
+                                   add_show_heatmap, add_style_after],
+                          outputs=[add_result, add_comparison, add_status,
+                                   add_plan_overlay, add_plan_reasoning, add_heatmap])
 
         # ── Tab 4: Mood Shift ─────────────────────────────────────────────
         with gr.Tab("Mood Shift"):
